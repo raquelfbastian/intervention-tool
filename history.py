@@ -780,93 +780,151 @@ forecast_compliance = forecast_next_value(
 
 
 # ============================================================
-# TARGET PROJECTION
+# TARGET DATE PROJECTION
+# Goal:
+# Given a required target date, estimate what Completion %
+# and Compliance % will be by that date based on current trend.
 # ============================================================
 
 import numpy as np
+import pandas as pd
+from datetime import datetime
 
-def estimate_target_date(df, metric_col, target_value):
-    forecast_df = df[
+st.subheader("Target Date Projection")
+
+# Change this if target date changes
+TARGET_DATE = pd.to_datetime("2026-08-31")
+
+# Business targets
+COMPLETION_TARGET = 100
+COMPLIANCE_TARGET = 100   # You can change this to 30, 50, 80 later if needed
+
+
+def project_value_at_target_date(df, metric_col, target_date):
+    projection_df = df[
         [
             "Snapshot Date",
             metric_col,
         ]
     ].dropna().copy()
 
-    if len(forecast_df) < 2:
+    if len(projection_df) < 2:
         return None, None
 
-    forecast_df = forecast_df.sort_values("Snapshot Date")
+    projection_df["Snapshot Date"] = pd.to_datetime(
+        projection_df["Snapshot Date"],
+        errors="coerce"
+    )
 
-    forecast_df["DaysFromStart"] = (
-        forecast_df["Snapshot Date"] - forecast_df["Snapshot Date"].min()
+    projection_df = projection_df.dropna(
+        subset=["Snapshot Date"]
+    )
+
+    if len(projection_df) < 2:
+        return None, None
+
+    projection_df = projection_df.sort_values(
+        "Snapshot Date"
+    )
+
+    start_date = projection_df["Snapshot Date"].min()
+
+    projection_df["DaysFromStart"] = (
+        projection_df["Snapshot Date"] - start_date
     ).dt.days
 
-    x = forecast_df["DaysFromStart"].values
-    y = forecast_df[metric_col].values
+    target_days_from_start = (
+        target_date - start_date
+    ).days
+
+    x = projection_df["DaysFromStart"].values
+    y = projection_df[metric_col].values
 
     slope, intercept = np.polyfit(x, y, 1)
 
-    if slope <= 0:
-        return None, slope
-
-    days_to_target = (target_value - intercept) / slope
-
-    if days_to_target < forecast_df["DaysFromStart"].max():
-        return None, slope
-
-    target_date = forecast_df["Snapshot Date"].min() + pd.Timedelta(
-        days=float(days_to_target)
+    projected_value = (
+        slope * target_days_from_start
+        + intercept
     )
 
-    return target_date, slope
+    # Cap display between 0 and 100
+    projected_value = max(0, min(100, projected_value))
+
+    return round(projected_value, 1), slope
 
 
-st.subheader("Target Projection")
-
-completion_100_date, completion_rate = estimate_target_date(
+projected_completion, completion_rate = project_value_at_target_date(
     trend_df,
     "Completion %",
-    100
+    TARGET_DATE
 )
 
-compliance_30_date, compliance_rate = estimate_target_date(
+projected_compliance, compliance_rate = project_value_at_target_date(
     trend_df,
     "Compliance %",
-    30
+    TARGET_DATE
 )
 
-compliance_50_date, _ = estimate_target_date(
-    trend_df,
-    "Compliance %",
-    50
+
+completion_gap = (
+    COMPLETION_TARGET - projected_completion
+    if projected_completion is not None
+    else None
 )
+
+compliance_gap = (
+    COMPLIANCE_TARGET - projected_compliance
+    if projected_compliance is not None
+    else None
+)
+
 
 col1, col2, col3 = st.columns(3)
 
 col1.metric(
-    "Projected 100% Completion",
-    completion_100_date.strftime("%b %d, %Y")
-    if completion_100_date is not None
-    else "N/A"
+    "Target Date",
+    TARGET_DATE.strftime("%b %d, %Y")
 )
 
 col2.metric(
-    "Projected 30% Compliance",
-    compliance_30_date.strftime("%b %d, %Y")
-    if compliance_30_date is not None
+    "Projected Completion by Target Date",
+    f"{projected_completion:.1f}%"
+    if projected_completion is not None
     else "N/A"
 )
 
 col3.metric(
-    "Projected 50% Compliance",
-    compliance_50_date.strftime("%b %d, %Y")
-    if compliance_50_date is not None
+    "Gap to 100% Completion",
+    f"{completion_gap:.1f}%"
+    if completion_gap is not None
     else "N/A"
 )
 
+
+col4, col5, col6 = st.columns(3)
+
+col4.metric(
+    "Projected Compliance by Target Date",
+    f"{projected_compliance:.1f}%"
+    if projected_compliance is not None
+    else "N/A"
+)
+
+col5.metric(
+    "Gap to 100% Compliance",
+    f"{compliance_gap:.1f}%"
+    if compliance_gap is not None
+    else "N/A"
+)
+
+col6.metric(
+    "Days Remaining to Target Date",
+    f"{(TARGET_DATE - trend_df['Snapshot Date'].max()).days} days"
+)
+
+
 st.caption(
-    "Projection is based on a simple linear trend from historical Completion % and Compliance % values."
+    "Projection is based on a simple linear trend using historical Completion % and Compliance % values."
 )
 
 if completion_rate is not None and compliance_rate is not None:
@@ -874,4 +932,3 @@ if completion_rate is not None and compliance_rate is not None:
         "Completion increase per day": round(completion_rate, 4),
         "Compliance increase per day": round(compliance_rate, 4),
     })
-
