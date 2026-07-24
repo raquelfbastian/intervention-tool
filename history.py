@@ -3,7 +3,7 @@ import re
 import pandas as pd
 from datetime import datetime
 import streamlit as st
-
+import numpy as np
 
 # ============================================================
 # CONFIG
@@ -364,129 +364,514 @@ selected_skill_type = st.sidebar.selectbox(
 )
 
 
-history_rows = []
 
-for dump_file in dump_files:
+# ============================================================
+# HISTORICAL SUMMARY CONFIG
+# ============================================================
 
-    print("=" * 80)
-    print("PROCESSING:", dump_file)
+HISTORY_FOLDER = "historical_dumps"
+HISTORY_SUMMARY_FILE = "historical_summary.xlsx"
 
-    try:
 
-        merged_df, resource_df = build_data(
-            DEFAULT_MASTER_FILE,
-            dump_file,
-            selected_business_group,
-            selected_skill_type
+# ============================================================
+# HELPER: GET VALID DUMP FILES
+# ============================================================
+
+def get_valid_dump_files(folder):
+    if not os.path.exists(folder):
+        return []
+
+    dump_files = sorted([
+        os.path.join(folder, f)
+        for f in os.listdir(folder)
+        if f.endswith(".xlsx")
+        and not f.startswith("~$")
+    ])
+
+    return dump_files
+
+
+# ============================================================
+# HELPER: PARSE DATE FROM FILENAME
+# Handles:
+# Dump_06_07_2026.xlsx
+# Dump_15_7_2026.xlsx
+# ============================================================
+
+def parse_snapshot_date_from_filename(filename):
+    basename = os.path.basename(filename)
+
+    match = re.search(
+        r"(\d{1,2})_(\d{1,2})_(\d{4})",
+        basename
+    )
+
+    if match:
+        day = int(match.group(1))
+        month = int(match.group(2))
+        year = int(match.group(3))
+
+        return datetime(year, month, day)
+
+    return None
+
+
+# ============================================================
+# HELPER: COMPUTE SCORECARD FROM resource_df
+# ============================================================
+
+def calculate_scorecard_from_resource_df(resource_df):
+    total_resources = resource_df[COL_PERSONNEL_NO].nunique()
+
+    assessed_resources = resource_df.loc[
+        resource_df["HasAssessment"] == True,
+        COL_PERSONNEL_NO,
+    ].nunique()
+
+    meeting_target_resources = resource_df.loc[
+        resource_df["MeetingTarget"] == True,
+        COL_PERSONNEL_NO,
+    ].nunique()
+
+    below_target_resources = resource_df.loc[
+        resource_df["BelowTarget"] == True,
+        COL_PERSONNEL_NO,
+    ].nunique()
+
+    no_assessment = total_resources - assessed_resources
+
+    completion_pct = (
+        assessed_resources / total_resources * 100
+        if total_resources > 0
+        else 0
+    )
+
+    compliance_pct = (
+        meeting_target_resources / total_resources * 100
+        if total_resources > 0
+        else 0
+    )
+
+    return {
+        "Total Resources": total_resources,
+        "Assessed Resources": assessed_resources,
+        "No Assessment": no_assessment,
+        "Below Target": below_target_resources,
+        "Completion %": round(completion_pct, 1),
+        "Compliance %": round(compliance_pct, 1),
+    }
+
+
+# ============================================================
+# GENERATE HISTORICAL SUMMARY FILE
+# ============================================================
+
+def generate_historical_summary_file():
+    dump_files = get_valid_dump_files(HISTORY_FOLDER)
+
+    history_rows = []
+
+    for dump_file in dump_files:
+
+        print("=" * 80)
+        print("PROCESSING:", dump_file)
+
+        try:
+            snapshot_date = parse_snapshot_date_from_filename(dump_file)
+
+            merged_df, resource_df = build_data(
+                DEFAULT_MASTER_FILE,
+                dump_file,
+                selected_business_group,
+                selected_skill_type,
+            )
+
+            scorecard = calculate_scorecard_from_resource_df(resource_df)
+
+            history_rows.append({
+                "Snapshot Date": snapshot_date,
+                "Snapshot": (
+                    snapshot_date.strftime("%b %d, %Y")
+                    if snapshot_date is not None
+                    else os.path.basename(dump_file)
+                ),
+                "Source File": os.path.basename(dump_file),
+                "Completion %": scorecard["Completion %"],
+                "Compliance %": scorecard["Compliance %"],
+                "Total Resources": scorecard["Total Resources"],
+                "Assessed Resources": scorecard["Assessed Resources"],
+                "No Assessment": scorecard["No Assessment"],
+                "Below Target": scorecard["Below Target"],
+                "Status": "Success",
+                "Error": "",
+            })
+
+            print("SUCCESS:", dump_file)
+
+        except Exception as e:
+            print("FAILED:", dump_file)
+            print("ERROR:", repr(e))
+
+            history_rows.append({
+                "Snapshot Date": None,
+                "Snapshot": os.path.basename(dump_file),
+                "Source File": os.path.basename(dump_file),
+                "Completion %": None,
+                "Compliance %": None,
+                "Total Resources": None,
+                "Assessed Resources": None,
+                "No Assessment": None,
+                "Below Target": None,
+                "Status": "Failed",
+                "Error": str(e),
+            })
+
+    history_df = pd.DataFrame(history_rows)
+
+    if not history_df.empty:
+        history_df = history_df.sort_values(
+            by=["Snapshot Date", "Source File"],
+            na_position="last"
         )
 
-        total_resources = resource_df[COL_PERSONNEL_NO].nunique()
+    history_df.to_excel(
+        HISTORY_SUMMARY_FILE,
+        index=False
+    )
 
-        assessed_resources = resource_df.loc[
-            resource_df["HasAssessment"] == True,
-            COL_PERSONNEL_NO,
-        ].nunique()
+    return history_df
 
-        meeting_target_resources = resource_df.loc[
-            resource_df["MeetingTarget"] == True,
-            COL_PERSONNEL_NO,
-        ].nunique()
 
-        below_target_resources = resource_df.loc[
-            resource_df["BelowTarget"] == True,
-            COL_PERSONNEL_NO,
-        ].nunique()
+# ============================================================
+# PAGE UI
+# ============================================================
 
-        no_assessment = total_resources - assessed_resources
+st.title("Historical Executive Summary")
 
-        completion_pct = (
-            assessed_resources / total_resources * 100
-            if total_resources > 0
-            else 0
+col_refresh, col_status = st.columns([1, 3])
+
+with col_refresh:
+    refresh_clicked = st.button("Refresh Historical Summary")
+
+with col_status:
+    if os.path.exists(HISTORY_SUMMARY_FILE):
+        st.info(f"Using saved file: {HISTORY_SUMMARY_FILE}")
+    else:
+        st.warning("No historical summary file found yet. Click refresh to generate one.")
+
+
+# ============================================================
+# REFRESH / GENERATE SUMMARY
+# ============================================================
+
+if refresh_clicked:
+    with st.spinner("Generating historical summary from dumps..."):
+        history_df = generate_historical_summary_file()
+
+    st.success("Historical summary file generated successfully.")
+
+else:
+    if os.path.exists(HISTORY_SUMMARY_FILE):
+        history_df = pd.read_excel(HISTORY_SUMMARY_FILE)
+    else:
+        history_df = pd.DataFrame()
+
+
+# ============================================================
+# DISPLAY SUMMARY
+# ============================================================
+
+if history_df.empty:
+    st.warning("No historical summary data available yet.")
+
+else:
+    display_df = history_df.copy()
+
+    # Keep only successful rows for main table and charts
+    success_df = display_df[
+        display_df["Status"] == "Success"
+    ].copy()
+
+    if not success_df.empty:
+        success_df["Snapshot Date"] = pd.to_datetime(
+            success_df["Snapshot Date"],
+            errors="coerce"
         )
 
-        target_compliance_pct = (
-            meeting_target_resources / total_resources * 100
-            if total_resources > 0
-            else 0
+        success_df = success_df.sort_values("Snapshot Date")
+
+        main_table = success_df[
+            [
+                "Snapshot",
+                "Completion %",
+                "Compliance %",
+                "Total Resources",
+                "Assessed Resources",
+                "No Assessment",
+                "Below Target",
+                "Source File",
+            ]
+        ].copy()
+
+        st.subheader("Historical Summary Table")
+
+        st.dataframe(
+            main_table,
+            width="stretch"
         )
 
-        history_rows.append({
-            "Snapshot": os.path.basename(dump_file),
-            "Completion %": round(completion_pct, 1),
-            "Compliance %": round(target_compliance_pct, 1),
-            "Total Resources": total_resources,
-            "Assessed Resources": assessed_resources,
-            "No Assessment": no_assessment,
-            "Below Target": below_target_resources,
-        })
+        # ============================================================
+        # COMPLETION AND COMPLIANCE TREND - FIXED DATE ORDER
+        # ============================================================
 
-        print("SUCCESS:", dump_file)
+        st.subheader("Completion and Compliance Trend")
 
-    except Exception as e:
+        trend_df = success_df.copy()
 
-        print("FAILED:", dump_file)
-        print("ERROR:", repr(e))
+        trend_df["Snapshot Date"] = pd.to_datetime(
+            trend_df["Snapshot Date"],
+            errors="coerce"
+        )
 
-        history_rows.append({
-            "Snapshot": os.path.basename(dump_file),
-            "Completion %": None,
-            "Compliance %": None,
-            "Total Resources": None,
-            "Assessed Resources": None,
-            "No Assessment": None,
-            "Below Target": None,
-        })
+        trend_df = trend_df.dropna(
+            subset=["Snapshot Date"]
+        )
 
-history_df = pd.DataFrame(history_rows)
+        trend_df = trend_df.sort_values(
+            "Snapshot Date"
+        ).reset_index(drop=True)
 
-history_df["SnapshotDate"] = history_df["Snapshot"].apply(parse_snapshot_date)
+        chart_df = trend_df[
+            [
+                "Snapshot Date",
+                "Completion %",
+                "Compliance %",
+            ]
+        ].copy()
 
-history_df = history_df.sort_values("SnapshotDate")
+        chart_df = chart_df.set_index("Snapshot Date")
 
-history_df["Snapshot"] = history_df["SnapshotDate"].dt.strftime("%b %d, %Y")
+        st.line_chart(
+            chart_df[
+                [
+                    "Completion %",
+                    "Compliance %",
+                ]
+            ]
+        )
 
-history_df = history_df.drop(columns=["SnapshotDate"])
+        # ============================================================
+        # LATEST METRICS - USE SORTED DATA
+        # ============================================================
 
-st.subheader("Historical Executive Summary")
+        if len(trend_df) >= 2:
+            latest = trend_df.iloc[-1]
+            previous = trend_df.iloc[-2]
+
+            completion_delta = (
+                latest["Completion %"] - previous["Completion %"]
+            )
+
+            compliance_delta = (
+                latest["Compliance %"] - previous["Compliance %"]
+            )
+
+            col1, col2 = st.columns(2)
+
+            col1.metric(
+                "Latest Completion %",
+                f"{latest['Completion %']:.1f}%",
+                f"{completion_delta:.1f}%"
+            )
+
+            col2.metric(
+                "Latest Compliance %",
+                f"{latest['Compliance %']:.1f}%",
+                f"{compliance_delta:.1f}%"
+            )
+
+    # ========================================================
+    # FAILED FILES SECTION
+    # ========================================================
+
+    failed_df = display_df[
+        display_df["Status"] == "Failed"
+    ].copy()
+
+    if not failed_df.empty:
+        st.subheader("Files with Processing Errors")
+
+        st.dataframe(
+            failed_df[
+                [
+                    "Source File",
+                    "Error",
+                ]
+            ],
+            width="stretch"
+        )
 
 
-history_chart_df = history_df[
-    ["Snapshot", "Completion %", "Compliance %"]
-].copy()
-
-
-st.dataframe(
-    history_chart_df,
-    use_container_width=True
+# Make sure Snapshot Date exists
+history_df["Snapshot Date"] = pd.to_datetime(
+    history_df["Snapshot"],
+    errors="coerce"
 )
 
-st.subheader("Completion Trend")
+history_df = history_df.sort_values("Snapshot Date").reset_index(drop=True)
 
-chart_df = history_df[
-    ["Snapshot", "Completion %", "Compliance %"]
-].copy()
+# Create numeric day index from first snapshot
+history_df["DaysFromStart"] = (
+    history_df["Snapshot Date"] - history_df["Snapshot Date"].min()
+).dt.days
 
-chart_df = chart_df.set_index("Snapshot")
 
-st.line_chart(chart_df)
 
-latest_completion = history_df.iloc[-1]["Completion %"]
-previous_completion = history_df.iloc[-2]["Completion %"]
+def forecast_next_value(df, metric_col):
+    valid_df = df.dropna(subset=["Snapshot Date", metric_col]).copy()
 
-latest_compliance = history_df.iloc[-1]["Compliance %"]
-previous_compliance = history_df.iloc[-2]["Compliance %"]
+    if len(valid_df) < 2:
+        return None
 
-col1, col2 = st.columns(2)
+    valid_df["Snapshot Date"] = pd.to_datetime(
+        valid_df["Snapshot Date"],
+        errors="coerce"
+    )
+
+    valid_df = valid_df.dropna(subset=["Snapshot Date"])
+
+    if len(valid_df) < 2:
+        return None
+
+    valid_df = valid_df.sort_values("Snapshot Date")
+
+    valid_df["DaysFromStart"] = (
+        valid_df["Snapshot Date"] - valid_df["Snapshot Date"].min()
+    ).dt.days
+
+    x = valid_df["DaysFromStart"].values
+    y = valid_df[metric_col].values
+
+    slope, intercept = np.polyfit(x, y, 1)
+
+    avg_gap = valid_df["DaysFromStart"].diff().dropna().mean()
+
+    if pd.isna(avg_gap):
+        return None
+
+    next_day = valid_df["DaysFromStart"].max() + avg_gap
+
+    forecast_value = slope * next_day + intercept
+
+    return round(forecast_value, 1)
+
+
+forecast_completion = forecast_next_value(
+    success_df,
+    "Completion %"
+)
+
+forecast_compliance = forecast_next_value(
+    success_df,
+    "Compliance %"
+)
+
+
+
+
+# ============================================================
+# TARGET PROJECTION
+# ============================================================
+
+import numpy as np
+
+def estimate_target_date(df, metric_col, target_value):
+    forecast_df = df[
+        [
+            "Snapshot Date",
+            metric_col,
+        ]
+    ].dropna().copy()
+
+    if len(forecast_df) < 2:
+        return None, None
+
+    forecast_df = forecast_df.sort_values("Snapshot Date")
+
+    forecast_df["DaysFromStart"] = (
+        forecast_df["Snapshot Date"] - forecast_df["Snapshot Date"].min()
+    ).dt.days
+
+    x = forecast_df["DaysFromStart"].values
+    y = forecast_df[metric_col].values
+
+    slope, intercept = np.polyfit(x, y, 1)
+
+    if slope <= 0:
+        return None, slope
+
+    days_to_target = (target_value - intercept) / slope
+
+    if days_to_target < forecast_df["DaysFromStart"].max():
+        return None, slope
+
+    target_date = forecast_df["Snapshot Date"].min() + pd.Timedelta(
+        days=float(days_to_target)
+    )
+
+    return target_date, slope
+
+
+st.subheader("Target Projection")
+
+completion_100_date, completion_rate = estimate_target_date(
+    trend_df,
+    "Completion %",
+    100
+)
+
+compliance_30_date, compliance_rate = estimate_target_date(
+    trend_df,
+    "Compliance %",
+    30
+)
+
+compliance_50_date, _ = estimate_target_date(
+    trend_df,
+    "Compliance %",
+    50
+)
+
+col1, col2, col3 = st.columns(3)
 
 col1.metric(
-    "Completion %",
-    f"{latest_completion:.1f}%",
-    f"{latest_completion - previous_completion:.1f}%"
+    "Projected 100% Completion",
+    completion_100_date.strftime("%b %d, %Y")
+    if completion_100_date is not None
+    else "N/A"
 )
 
 col2.metric(
-    "Compliance %",
-    f"{latest_compliance:.1f}%",
-    f"{latest_compliance - previous_compliance:.1f}%"
+    "Projected 30% Compliance",
+    compliance_30_date.strftime("%b %d, %Y")
+    if compliance_30_date is not None
+    else "N/A"
 )
+
+col3.metric(
+    "Projected 50% Compliance",
+    compliance_50_date.strftime("%b %d, %Y")
+    if compliance_50_date is not None
+    else "N/A"
+)
+
+st.caption(
+    "Projection is based on a simple linear trend from historical Completion % and Compliance % values."
+)
+
+if completion_rate is not None and compliance_rate is not None:
+    st.write({
+        "Completion increase per day": round(completion_rate, 4),
+        "Compliance increase per day": round(compliance_rate, 4),
+    })
+
