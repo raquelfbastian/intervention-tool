@@ -209,9 +209,56 @@ def build_data(master_source, result_source, selected_business_group, selected_s
     # ASSESSMENT + COMPETENCY LOGIC
     # ============================================================
 
-    merged_df["proficiency_num"] = pd.to_numeric(
-        merged_df["Result Proficiency"],
-        errors="coerce"
+
+    proficiency_map = {
+        "NULL": -1,
+        "P0": 0,
+        "P1": 1,
+        "P2": 2,
+        "P3": 3,
+        "Expert eligible": 4,
+    }
+
+    merged_df["proficiency_num"] = (
+    merged_df["Result Proficiency Description"]
+        .fillna("NULL")
+        .map(proficiency_map)
+    )
+
+
+    # ============================================================
+    # Proficiency rank based on Proficiency Description
+    # Source of truth:
+    # NULL = No Assessment
+    # P0 = 0
+    # P1 = 1
+    # P2 = 2
+    # P3 = 3
+    # Expert eligible = 4
+    # ============================================================
+
+    PROFICIENCY_RANK_MAP = {
+        "P0": 0,
+        "P1": 1,
+        "P2": 2,
+        "P3": 3,
+        "Expert eligible": 4,
+    }
+
+    merged_df["proficiency_desc_clean"] = (
+        merged_df["Result Proficiency Description"]
+        .astype(str)
+        .str.strip()
+    )
+
+    merged_df.loc[
+        merged_df["proficiency_desc_clean"].str.upper().isin(["NULL", "NAN", "NONE", ""]),
+        "proficiency_desc_clean"
+    ] = None
+
+    merged_df["proficiency_num"] = (
+        merged_df["proficiency_desc_clean"]
+        .map(PROFICIENCY_RANK_MAP)
     )
 
     merged_df["has_assessment"] = merged_df["proficiency_num"].notna()
@@ -228,21 +275,19 @@ def build_data(master_source, result_source, selected_business_group, selected_s
 
         level = int(level)
 
-        # CL12 and CL11 target = P2
-        # In the new scale:
-        # P1 = 0
-        # P2 = 1
-        # P3 = 2
-        # Expert Eligible = 3
-        if level in [11, 12]:
-            return 2
-
+        # Business rule:
+        # CL11/CL12 target = P2
         # CL10 and up target = P3
-        # "up" means CL10, CL9, CL8, etc.
+
+        if level in [11, 12]:
+            return 2   # P2
+
         if level <= 10:
-            return 3
+            return 3   # P3
 
         return None
+
+    
 
 
     merged_df["target_proficiency_num"] = (
@@ -298,10 +343,30 @@ def build_data(master_source, result_source, selected_business_group, selected_s
             MeetingTarget=("meets_target", "max"),
             BelowTarget=("below_target", "max"),
             ActionReason=("Action Reason", "first"),
-            ActualProficiency=("proficiency_num", "max"),
-            TargetProficiency=("target_proficiency_num", "first"),
+            ActualProficiencyRank=("proficiency_num", "max"),
+            TargetProficiencyRank=("target_proficiency_num", "first"),
         )
     )
+
+    PROFICIENCY_LABEL_MAP = {
+        0: "P0",
+        1: "P1",
+        2: "P2",
+        3: "P3",
+        4: "Expert eligible",
+    }
+
+    resource_df["ActualProficiency"] = (
+        resource_df["ActualProficiencyRank"]
+        .map(PROFICIENCY_LABEL_MAP)
+    )
+
+    resource_df["TargetProficiency"] = (
+        resource_df["TargetProficiencyRank"]
+        .map(PROFICIENCY_LABEL_MAP)
+    )
+
+
 
     return merged_df, resource_df
 
@@ -1052,6 +1117,7 @@ skill_members_df = skill_members_df.merge(
         [
             COL_PERSONNEL_NO,
             "EID",
+            "Project",
             "ManagementLevel",
             "ActionReason",
             "ActualProficiency",
@@ -1117,6 +1183,7 @@ display_cols = [
     c
     for c in [
         identifier_col,
+        "Project",
         "ManagementLevel",
         "TargetProficiency",
         "ActualProficiency",
@@ -1129,6 +1196,7 @@ display_df = skill_members_df[display_cols].copy()
 
 display_df = display_df.rename(
     columns={
+         "Project": "Project",
         "ManagementLevel": "Level",
         "TargetProficiency": "Target Proficiency",
         "ActualProficiency": "Actual Proficiency",
@@ -1225,6 +1293,7 @@ def build_skill_chase_workbook(
                     [
                         COL_PERSONNEL_NO,
                         "EID",
+                        "Project",
                         "ManagementLevel",
                         "ActionReason",
                         "ActualProficiency",
@@ -1294,6 +1363,7 @@ def build_skill_chase_workbook(
                 c
                 for c in [
                     identifier_col,
+                    "Project",
                     "ManagementLevel",
                     "TargetProficiency",
                     "ActualProficiency",
@@ -1350,6 +1420,17 @@ def build_skill_chase_workbook(
 
     output.seek(0)
     return output
+
+cols = [
+    COL_PERSONNEL_NO,
+    "EID",
+    "Project",
+    "ManagementLevel",
+    "ActionReason",
+    "ActualProficiency",
+    "TargetProficiency",
+]
+
 
 skill_chase_excel = build_skill_chase_workbook(
     skill_summary_df=skill_summary_df,
