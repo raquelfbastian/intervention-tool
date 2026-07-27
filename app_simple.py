@@ -2,6 +2,8 @@ import io
 import pandas as pd
 import streamlit as st
 import plotly.express as px
+import io
+import re
 
 from secondary_skill_dashboard import render_secondary_dashboard
 
@@ -10,7 +12,7 @@ from secondary_skill_dashboard import render_secondary_dashboard
 # ============================================================
 
 DEFAULT_MASTER_FILE = "input/MyC_Report_as_of_2026_07_22_Tech_.xlsx"
-DEFAULT_RESULT_FILE = "input/Dump_20_7_2026.xlsx"
+DEFAULT_RESULT_FILE = "input/Dump_27_07_2026.xlsx"
 
 DETAILS_SHEET_NAME = "Details"
 
@@ -319,10 +321,15 @@ page_titles = {
     "Secondary Skills Explorer": "🚀 myCompetency Secondary Skills Explorer",
 }
 page_captions = {
-    "Primary Scorecard": "Simple reset version: Master Source File + Proficiency Result File",
-    "Secondary Skills Explorer": "Secondary Skill capability and future-readiness analytics.",
-}
+    "Primary Scorecard":
+        "Capability visibility dashboard showing assessment completion, compliance, intervention opportunities, and workforce readiness indicators.",
 
+    "Secondary Skills Explorer":
+        "Discover adjacent skills, hidden talent pools, and capability pathways to accelerate readiness for strategic offerings.",
+
+    "Historical Executive Summary":
+        "Historical trends, target projections, and readiness progress tracking across capability snapshots.",
+}
 # ---------------------------
 # Sidebar
 # ---------------------------
@@ -612,6 +619,7 @@ if show_resource_detail:
         )
 
         csv_data = filtered_display[cols_eid_only].to_csv(index=False).encode("utf-8")
+        
     else:
         # Show Personnel No (COL_PERSONNEL_NO) when EID is not toggled or missing
         if COL_PERSONNEL_NO not in filtered_display.columns and COL_PERSONNEL_NO in display_df.columns:
@@ -939,329 +947,748 @@ with c2:
     st.plotly_chart(fig_skill, use_container_width=True)
 
 
-    # ============================================================
-    # EXCEL OUTPUT FOR PEOPLE LEAD / PROJECT FOLLOW-UP
-    # ============================================================
+# ============================================================
+# PER SKILL SUMMARY
+# ============================================================
 
-    def create_chase_excel(
-        summary_df,
-        project_df,
-        resource_detail_df,
-        skill_gap_df,
-        career_summary_df,
-        selected_business_group,
-        assessment_scope,
-    ):
-        output = io.BytesIO()
+skill_summary_df = (
+    merged_df
+    .groupby([COL_SKILL_NAME, COL_SKILL_TYPE], as_index=False)
+    .agg(
+        Total_Resources=(COL_PERSONNEL_NO, "nunique"),
+        Assessed_Resources=(
+            COL_PERSONNEL_NO,
+            lambda x: merged_df.loc[
+                x.index,
+                "has_assessment"
+            ].eq(True).groupby(x).any().sum()
+        ),
+        Meeting_Target=(
+            COL_PERSONNEL_NO,
+            lambda x: merged_df.loc[
+                x.index,
+                "meets_target"
+            ].eq(True).groupby(x).any().sum()
+        ),
+        Below_Target=(
+            COL_PERSONNEL_NO,
+            lambda x: merged_df.loc[
+                x.index,
+                "below_target"
+            ].eq(True).groupby(x).any().sum()
+        ),
+    )
+)
 
-        # local imports used by the full writer
-        import matplotlib.pyplot as plt
-        from openpyxl.drawing.image import Image as ExcelImage
+skill_summary_df["No_Assessment"] = (
+    skill_summary_df["Total_Resources"]
+    - skill_summary_df["Assessed_Resources"]
+)
 
-        with pd.ExcelWriter(output, engine="openpyxl") as writer:
-            # Write sheets
-            summary_df.to_excel(
-                writer,
-                sheet_name="Executive Summary",
-                index=False,
-                startrow=0,
-            )
+skill_summary_df["Completion %"] = (
+    skill_summary_df["Assessed_Resources"]
+    / skill_summary_df["Total_Resources"]
+    * 100
+).round(1)
 
-            project_df.to_excel(
-                writer,
-                sheet_name="Project Action Summary",
-                index=False,
-            )
+skill_summary_df["Compliance %"] = (
+    skill_summary_df["Meeting_Target"]
+    / skill_summary_df["Total_Resources"]
+    * 100
+).round(1)
 
-            resource_detail_df.to_excel(
-                writer,
-                sheet_name="Resource Chase Detail",
-                index=False,
-            )
+skill_summary_df = skill_summary_df.sort_values(
+    by="Total_Resources",
+    ascending=False
+)
 
-            skill_gap_df.to_excel(
-                writer,
-                sheet_name="Skill Gap Summary",
-                index=False,
-            )
+st.subheader("Per Skill Summary")
 
-            career_summary_df.to_excel(
-                writer,
-                sheet_name="Career Level Health",
-                index=False,
-            )
-
-            workbook = writer.book
-            ws = writer.sheets["Executive Summary"]
-            from openpyxl.styles import Font, PatternFill, Alignment
-
-            # Style Executive Summary row 1 and row 2
-            header_fill = PatternFill(fill_type="solid", fgColor="D9EAF7")
-
-            value_fill = PatternFill(fill_type="solid", fgColor="F3F8FC")
-
-            for cell in ws[1]:
-                cell.font = Font(bold=True, size=13)
-                cell.fill = header_fill
-                cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
-
-            for cell in ws[2]:
-                cell.font = Font(bold=True, size=13)
-                cell.fill = value_fill
-                cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
-
-            ws.row_dimensions[1].height = 24
-            ws.row_dimensions[2].height = 24
-
-            # Add metric definitions in same Executive Summary sheet
-            definitions = [
-                ["Metric", "Meaning"],
-                ["Business Group", "Business group included in the analysis, such as Tech_Song, Tech_Adobe Platform, or All."],
-                ["Assessment Scope", "Indicates whether the analysis includes Primary Skills, Secondary Skills, or All Skills."],
-                ["Total Resources", "Total unique resources included in the selected business group and assessment scope."],
-                ["Assessed Resources", "Resources with a completed competency assessment."],
-                ["Completion %", "Percentage of resources with completed assessments. Formula: Assessed Resources / Total Resources x 100."],
-                ["Target Compliance %", "Percentage of resources meeting or exceeding the required target proficiency."],
-                ["No Assessment", "Resources without a completed competency assessment. These require assessment completion follow-up."],
-                ["Below Target", "Resources who completed an assessment but are below the required target proficiency. These require capability uplift, learning, coaching, or reassessment action."],
-            ]
-
-            # Put definitions starting row 5 para hindi matatamaan yung summary
-            start_row = 5
-
-            for r_idx, row in enumerate(definitions, start=start_row):
-                for c_idx, value in enumerate(row, start=1):
-                    ws.cell(row=r_idx, column=c_idx, value=value)
-
-            # Create Top Projects chart as image
-            chart_start_row = start_row + len(definitions) + 3
-
-            try:
-                top_projects = (
-                    project_df
-                    .sort_values("Resources To Chase", ascending=False)
-                    .head(10)
-                    .copy()
-                )
-
-                if len(top_projects) > 0:
-                    plt.figure(figsize=(10, 6))
-                    plt.barh(
-                        top_projects["Project"],
-                        top_projects["Resources To Chase"],
-                    )
-                    plt.xlabel("Resources To Chase")
-                    plt.ylabel("Project")
-                    plt.title("Top Projects With Most Resources To Chase")
-                    plt.gca().invert_yaxis()
-                    plt.tight_layout()
-
-                    chart_path = "top_projects_chart.png"
-                    plt.savefig(chart_path, dpi=150)
-                    plt.close()
-
-                    img = ExcelImage(chart_path)
-                    img.width = 720
-                    img.height = 420
-
-                    ws.add_image(img, f"A{chart_start_row}")
-
-            except Exception:
-                # Do not fail Excel generation if chart creation fails
-                ws.cell(
-                    row=chart_start_row,
-                    column=1,
-                    value="Chart could not be generated. Please refer to Project Action Summary tab.",
-                )
-
-            # Basic formatting
-            for sheet_name in writer.sheets:
-                worksheet = writer.sheets[sheet_name]
-                if sheet_name == "Resource Chase Detail":
-                    project_header_fill = PatternFill(
-                        fill_type="solid",
-                        fgColor="BDD7EE"
-                    )
-
-                    for row in range(2, worksheet.max_row + 1):
-                        project_value = worksheet.cell(row=row, column=2).value
-
-                        if isinstance(project_value, str) and project_value.startswith("PROJECT:"):
-                            for col in range(1, worksheet.max_column + 1):
-                                cell = worksheet.cell(row=row, column=col)
-                                cell.font = Font(bold=True, size=12)
-                                cell.fill = project_header_fill
-                                cell.alignment = Alignment(horizontal="left", vertical="center")
-
-                            worksheet.row_dimensions[row].height = 22
-                worksheet.freeze_panes = "A2"
-
-                # Round numeric values to no decimals and set integer number format
-                for col_idx, header_cell in enumerate(worksheet[1], start=1):
-                    for row_idx in range(2, worksheet.max_row + 1):
-                        cell = worksheet.cell(row=row_idx, column=col_idx)
-                        if isinstance(cell.value, (int, float)):
-                            try:
-                                cell.value = round(cell.value, 0)
-                            except Exception:
-                                pass
-                            cell.number_format = '0'
-
-                for column_cells in worksheet.columns:
-                    max_length = 0
-                    column_letter = column_cells[0].column_letter
-
-                    for cell in column_cells:
-                        try:
-                            cell_length = len(str(cell.value)) if cell.value is not None else 0
-                            if cell_length > max_length:
-                                max_length = cell_length
-                        except Exception:
-                            pass
-
-                    worksheet.column_dimensions[column_letter].width = min(max_length + 2, 45)
-
-        output.seek(0)
-        return output
+st.dataframe(
+    skill_summary_df,
+    use_container_width=True
+)
 
 
-    def build_grouped_resource_export(resource_export):
-        grouped_rows = []
-        columns = list(resource_export.columns)
-
-        for project_name, group in resource_export.groupby("Project", sort=True):
-            project_header = {col: "" for col in columns}
-            project_header["Project"] = f"PROJECT: {project_name}"
-            grouped_rows.append(project_header)
-
-            # Sort rows within each project by Action Reason priority
-            sort_order = ["No Assessment", "Below Target", "Meeting Target"]
-            g = group.copy()
-            if "Action Reason" in g.columns:
-                g["Action Reason Order"] = pd.Categorical(
-                    g["Action Reason"], categories=sort_order, ordered=True
-                )
-                # Rows with specified categories appear first in the defined order; others follow
-                g = g.sort_values(by=["Action Reason Order"], na_position="last")
-                g = g.drop(columns=["Action Reason Order"])
-
-            # append sorted rows
-            grouped_rows.extend(g.to_dict("records"))
-
-        return pd.DataFrame(grouped_rows, columns=columns)
 
 
-    # Prepare export dataframes
-    summary_df = pd.DataFrame(
+
+# ============================================================
+# SKILL DRILLDOWN: WHO IS IN THIS SKILL?
+# ============================================================
+
+st.subheader("Skill Drilldown: Who is in this skill?")
+
+skill_options = (
+    skill_summary_df
+    .apply(
+        lambda x:
+        f"{x[COL_SKILL_NAME]} "
+        f"(Resources: {x['Total_Resources']}, "
+        f"No Assessment: {x['No_Assessment']}, "
+        f"Below Target: {x['Below_Target']})",
+        axis=1
+    )
+    .tolist()
+)
+
+selected_skill_option = st.selectbox(
+    "Select skill for drilldown",
+    skill_options,
+    key="skill_drilldown"
+)
+
+selected_skill = selected_skill_option.split(" (")[0]
+
+skill_members_df = (
+    merged_df[
+        merged_df[COL_SKILL_NAME] == selected_skill
+    ]
+    .copy()
+)
+
+skill_members_df = skill_members_df.merge(
+    resource_df[
         [
-            {
-                "Business Group": scope_label,
-                "Assessment Scope": selected_skill_type,
-                "Total Resources": total_resources,
-                "Assessed Resources": assessed_resources,
-                "Completion %": round(completion_pct, 0),
-                "Target Compliance %": round(target_compliance_pct, 0),
-                "No Assessment": no_assessment,
-                "Below Target": below_target_resources,
-            }
+            COL_PERSONNEL_NO,
+            "EID",
+            "ManagementLevel",
+            "ActionReason",
+            "ActualProficiency",
+            "TargetProficiency",
+        ]
+    ],
+    on=COL_PERSONNEL_NO,
+    how="left"
+)
+
+# Keep one row per resource
+skill_members_df = (
+    skill_members_df
+    .drop_duplicates(
+        subset=[COL_PERSONNEL_NO]
+    )
+    .copy()
+)
+
+# Keep only resources to chase
+skill_members_df = skill_members_df[
+    skill_members_df["ActionReason"].isin(
+        [
+            "No Assessment",
+            "Below Target",
         ]
     )
+].copy()
 
-    project_export_cols = [
-        "Project",
-        "TotalResources",
-        "No Assessment",
-        "Below Target Only",
-        "Resources To Chase",
-        "Chase %",
-        "Completion %",
-        "Target Compliance %",
-        "Priority Score",
+# Sort Action Reason first
+action_order = {
+    "No Assessment": 1,
+    "Below Target": 2,
+}
+
+skill_members_df["ActionOrder"] = (
+    skill_members_df["ActionReason"]
+    .map(action_order)
+    .fillna(999)
+)
+
+# Sort Level properly
+skill_members_df["LevelSort"] = pd.to_numeric(
+    skill_members_df["ManagementLevel"],
+    errors="coerce"
+)
+
+skill_members_df = skill_members_df.sort_values(
+    by=[
+        "ActionOrder",
+        "LevelSort",
+        COL_PERSONNEL_NO,
     ]
+)
 
-    project_export = pd.DataFrame()
-    if 'project_rank' in globals():
-        project_export = project_rank.reindex(columns=project_export_cols).copy()
+# Decide identifier column
+if show_eid and "EID" in skill_members_df.columns:
+    identifier_col = "EID"
+else:
+    identifier_col = COL_PERSONNEL_NO
 
-    # Resource export: use displayed names and a conservative column set
-    resource_export = resource_df.rename(
-        columns={
-            "SkillName": "Primary Skill",
-            "career_level_num": "Career Level",
-            "ActionReason": "Action Reason",
-        }
-    )
+display_cols = [
+    c
+    for c in [
+        identifier_col,
+        "ManagementLevel",
+        "TargetProficiency",
+        "ActualProficiency",
+        "ActionReason",
+    ]
+    if c in skill_members_df.columns
+]
 
-    # select conservative columns if present
-    desired_cols = ["EID", "Project", "Primary Skill", "Career Level", "Target", "Actual", "Action Reason"]
-    resource_export = resource_export[[c for c in desired_cols if c in resource_export.columns]]
+display_df = skill_members_df[display_cols].copy()
 
-    # Enforce Action Reason ordering for exports and sort per-project by Action Reason then Career Level (high->low)
-    action_sort_order = {
+display_df = display_df.rename(
+    columns={
+        "ManagementLevel": "Level",
+        "TargetProficiency": "Target Proficiency",
+        "ActualProficiency": "Actual Proficiency",
+        "ActionReason": "Action Reason",
+    }
+)
+
+st.dataframe(
+    display_df,
+    use_container_width=True,
+    hide_index=True,
+)
+
+# ============================================================
+# CSV DOWNLOAD
+# ============================================================
+
+safe_skill = (
+    selected_skill
+    .replace("/", "_")
+    .replace("\\", "_")
+    .replace(" ", "_")
+)
+
+csv_data = display_df.to_csv(
+    index=False
+).encode("utf-8")
+
+st.download_button(
+    label="Download Skill Drilldown CSV",
+    data=csv_data,
+    file_name=f"myCompetency_{safe_skill}_Skill_Drilldown.csv",
+    mime="text/csv"
+)
+
+
+import io
+import re
+
+def safe_sheet_name(name):
+    # Excel sheet names max 31 chars and cannot contain these: \ / ? * [ ]
+    cleaned = re.sub(r'[\\/*?:\[\]]', "_", str(name))
+    return cleaned[:31]
+
+
+# ============================================================
+# DOWNLOAD: ONE EXCEL FILE, ONE SHEET PER SKILL
+# ============================================================
+
+def build_skill_chase_workbook(
+    skill_summary_df,
+    merged_df,
+    resource_df,
+    show_eid,
+):
+    output = io.BytesIO()
+
+    action_order = {
         "No Assessment": 1,
         "Below Target": 2,
         "Meeting Target": 3,
     }
 
-    if "Action Reason" in resource_export.columns:
-        resource_export["Action Sort"] = (
-            resource_export["Action Reason"].map(action_sort_order).fillna(99)
+    with pd.ExcelWriter(output, engine="openpyxl") as writer:
+
+        # ====================================================
+        # Sheet 1: Per Skill Summary
+        # ====================================================
+
+        skill_summary_df.to_excel(
+            writer,
+            sheet_name="Per Skill Summary",
+            index=False
         )
 
-        # ensure numeric career level sort key
-        if "Career Level" in resource_export.columns:
-            resource_export["_career_level_sort"] = pd.to_numeric(resource_export["Career Level"], errors="coerce")
-        else:
-            resource_export["_career_level_sort"] = pd.NA
+        # ====================================================
+        # One sheet per skill
+        # ====================================================
 
-        resource_export = resource_export.sort_values(
-            by=["Project", "Action Sort", "_career_level_sort", "Primary Skill", "EID"],
-            ascending=[True, True, True, True, True],
-            na_position="last",
+        for _, skill_row in skill_summary_df.iterrows():
+
+            skill_name = skill_row[COL_SKILL_NAME]
+
+            skill_members_df = (
+                merged_df[
+                    merged_df[COL_SKILL_NAME] == skill_name
+                ]
+                .copy()
+            )
+
+            # Merge resource-level fields from resource_df
+            skill_members_df = skill_members_df.merge(
+                resource_df[
+                    [
+                        COL_PERSONNEL_NO,
+                        "EID",
+                        "ManagementLevel",
+                        "ActionReason",
+                        "ActualProficiency",
+                        "TargetProficiency",
+                    ]
+                ],
+                on=COL_PERSONNEL_NO,
+                how="left"
+            )
+
+            # One row per resource
+            skill_members_df = (
+                skill_members_df
+                .drop_duplicates(
+                    subset=[COL_PERSONNEL_NO]
+                )
+                .copy()
+            )
+
+            # Keep only resources to chase
+            skill_members_df = skill_members_df[
+                skill_members_df["ActionReason"].isin(
+                    [
+                        "No Assessment",
+                        "Below Target",
+                    ]
+                )
+            ].copy()
+
+            # Skip skills with no resources to chase
+            if skill_members_df.empty:
+                continue
+
+            # Sorting
+            skill_members_df["ActionOrder"] = (
+                skill_members_df["ActionReason"]
+                .map(action_order)
+                .fillna(999)
+            )
+
+            skill_members_df["LevelSort"] = pd.to_numeric(
+                skill_members_df["ManagementLevel"],
+                errors="coerce"
+            )
+
+            skill_members_df = skill_members_df.sort_values(
+                by=[
+                    "ActionOrder",
+                    "LevelSort",
+                    COL_PERSONNEL_NO,
+                ],
+                ascending=[
+                    True,
+                    True,
+                    True,
+                ],
+                na_position="last"
+            )
+
+            # Decide identifier column
+            if show_eid and "EID" in skill_members_df.columns:
+                identifier_col = "EID"
+            else:
+                identifier_col = COL_PERSONNEL_NO
+
+            display_cols = [
+                c
+                for c in [
+                    identifier_col,
+                    "ManagementLevel",
+                    "TargetProficiency",
+                    "ActualProficiency",
+                    "ActionReason",
+                ]
+                if c in skill_members_df.columns
+            ]
+
+            export_df = skill_members_df[display_cols].copy()
+
+            export_df = export_df.rename(
+                columns={
+                    "EID": "EID",
+                    COL_PERSONNEL_NO: "Personnel No",
+                    "ManagementLevel": "Level",
+                    "TargetProficiency": "Target Proficiency",
+                    "ActualProficiency": "Actual Proficiency",
+                    "ActionReason": "Action Reason",
+                }
+            )
+
+            sheet_name = safe_sheet_name(skill_name)
+
+            export_df.to_excel(
+                writer,
+                sheet_name=sheet_name,
+                index=False
+            )
+
+        # ====================================================
+        # Basic formatting
+        # ====================================================
+
+        workbook = writer.book
+
+        for sheet_name in writer.sheets:
+            ws = writer.sheets[sheet_name]
+
+            ws.freeze_panes = "A2"
+
+            for column_cells in ws.columns:
+                max_length = 0
+                column_letter = column_cells[0].column_letter
+
+                for cell in column_cells:
+                    try:
+                        cell_length = len(str(cell.value)) if cell.value is not None else 0
+                        if cell_length > max_length:
+                            max_length = cell_length
+                    except Exception:
+                        pass
+
+                ws.column_dimensions[column_letter].width = min(max_length + 2, 40)
+
+    output.seek(0)
+    return output
+
+skill_chase_excel = build_skill_chase_workbook(
+    skill_summary_df=skill_summary_df,
+    merged_df=merged_df,
+    resource_df=resource_df,
+    show_eid=show_eid,
+)
+
+st.download_button(
+    label="Download Skill Chase Workbook",
+    data=skill_chase_excel,
+    file_name="myCompetency_Skill_Chase_Workbook.xlsx",
+    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+)
+
+
+# ============================================================
+# EXCEL OUTPUT FOR PEOPLE LEAD / PROJECT FOLLOW-UP
+# ============================================================
+
+def create_chase_excel(
+    summary_df,
+    project_df,
+    resource_detail_df,
+    skill_gap_df,
+    career_summary_df,
+    selected_business_group,
+    assessment_scope,
+):
+    output = io.BytesIO()
+
+    # local imports used by the full writer
+    import matplotlib.pyplot as plt
+    from openpyxl.drawing.image import Image as ExcelImage
+
+    with pd.ExcelWriter(output, engine="openpyxl") as writer:
+        # Write sheets
+        summary_df.to_excel(
+            writer,
+            sheet_name="Executive Summary",
+            index=False,
+            startrow=0,
         )
 
-        resource_export = resource_export.drop(columns=["Action Sort", "_career_level_sort"], errors="ignore")
+        project_df.to_excel(
+            writer,
+            sheet_name="Project Action Summary",
+            index=False,
+        )
 
-    skill_export = skill_gap[
-        [
-            "SkillName",
-            "TotalResources",
-            "NoAssessment",
-            "BelowTargetOnly",
-            "Resources To Chase",
-            "Target Gap %",
-            "Priority Score",
+        resource_detail_df.to_excel(
+            writer,
+            sheet_name="Resource Chase Detail",
+            index=False,
+        )
+
+        skill_gap_df.to_excel(
+            writer,
+            sheet_name="Skill Gap Summary",
+            index=False,
+        )
+
+        career_summary_df.to_excel(
+            writer,
+            sheet_name="Career Level Health",
+            index=False,
+        )
+
+        workbook = writer.book
+        ws = writer.sheets["Executive Summary"]
+        from openpyxl.styles import Font, PatternFill, Alignment
+
+        # Style Executive Summary row 1 and row 2
+        header_fill = PatternFill(fill_type="solid", fgColor="D9EAF7")
+
+        value_fill = PatternFill(fill_type="solid", fgColor="F3F8FC")
+
+        for cell in ws[1]:
+            cell.font = Font(bold=True, size=13)
+            cell.fill = header_fill
+            cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+
+        for cell in ws[2]:
+            cell.font = Font(bold=True, size=13)
+            cell.fill = value_fill
+            cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+
+        ws.row_dimensions[1].height = 24
+        ws.row_dimensions[2].height = 24
+
+        # Add metric definitions in same Executive Summary sheet
+        definitions = [
+            ["Metric", "Meaning"],
+            ["Business Group", "Business group included in the analysis, such as Tech_Song, Tech_Adobe Platform, or All."],
+            ["Assessment Scope", "Indicates whether the analysis includes Primary Skills, Secondary Skills, or All Skills."],
+            ["Total Resources", "Total unique resources included in the selected business group and assessment scope."],
+            ["Assessed Resources", "Resources with a completed competency assessment."],
+            ["Completion %", "Percentage of resources with completed assessments. Formula: Assessed Resources / Total Resources x 100."],
+            ["Target Compliance %", "Percentage of resources meeting or exceeding the required target proficiency."],
+            ["No Assessment", "Resources without a completed competency assessment. These require assessment completion follow-up."],
+            ["Below Target", "Resources who completed an assessment but are below the required target proficiency. These require capability uplift, learning, coaching, or reassessment action."],
         ]
-    ].copy()
 
-    skill_export = skill_export.rename(columns={"SkillName": "Primary Skill", "NoAssessment": "No Assessment", "BelowTargetOnly": "Below Target Only"})
+        # Put definitions starting row 5 para hindi matatamaan yung summary
+        start_row = 5
 
-    career_export = career_summary[
-        [
-            "Career Level",
-            "Total Resources",
-            "No Assessment",
-            "Completion %",
-            "Target Compliance %",
-            "Below Target",
-        ]
-    ].copy()
+        for r_idx, row in enumerate(definitions, start=start_row):
+            for c_idx, value in enumerate(row, start=1):
+                ws.cell(row=r_idx, column=c_idx, value=value)
 
-    resource_export_grouped = build_grouped_resource_export(resource_export)
+        # Create Top Projects chart as image
+        chart_start_row = start_row + len(definitions) + 3
 
-    excel_output = create_chase_excel(
-        summary_df=summary_df,
-        project_df=project_export,
-        resource_detail_df=resource_export_grouped,
-        skill_gap_df=skill_export,
-        career_summary_df=career_export,
-        selected_business_group=scope_label,
-        assessment_scope=selected_skill_type,
+        try:
+            top_projects = (
+                project_df
+                .sort_values("Resources To Chase", ascending=False)
+                .head(10)
+                .copy()
+            )
+
+            if len(top_projects) > 0:
+                plt.figure(figsize=(10, 6))
+                plt.barh(
+                    top_projects["Project"],
+                    top_projects["Resources To Chase"],
+                )
+                plt.xlabel("Resources To Chase")
+                plt.ylabel("Project")
+                plt.title("Top Projects With Most Resources To Chase")
+                plt.gca().invert_yaxis()
+                plt.tight_layout()
+
+                chart_path = "top_projects_chart.png"
+                plt.savefig(chart_path, dpi=150)
+                plt.close()
+
+                img = ExcelImage(chart_path)
+                img.width = 720
+                img.height = 420
+
+                ws.add_image(img, f"A{chart_start_row}")
+
+        except Exception:
+            # Do not fail Excel generation if chart creation fails
+            ws.cell(
+                row=chart_start_row,
+                column=1,
+                value="Chart could not be generated. Please refer to Project Action Summary tab.",
+            )
+
+        # Basic formatting
+        for sheet_name in writer.sheets:
+            worksheet = writer.sheets[sheet_name]
+            if sheet_name == "Resource Chase Detail":
+                project_header_fill = PatternFill(
+                    fill_type="solid",
+                    fgColor="BDD7EE"
+                )
+
+                for row in range(2, worksheet.max_row + 1):
+                    project_value = worksheet.cell(row=row, column=2).value
+
+                    if isinstance(project_value, str) and project_value.startswith("PROJECT:"):
+                        for col in range(1, worksheet.max_column + 1):
+                            cell = worksheet.cell(row=row, column=col)
+                            cell.font = Font(bold=True, size=12)
+                            cell.fill = project_header_fill
+                            cell.alignment = Alignment(horizontal="left", vertical="center")
+
+                        worksheet.row_dimensions[row].height = 22
+            worksheet.freeze_panes = "A2"
+
+            # Round numeric values to no decimals and set integer number format
+            for col_idx, header_cell in enumerate(worksheet[1], start=1):
+                for row_idx in range(2, worksheet.max_row + 1):
+                    cell = worksheet.cell(row=row_idx, column=col_idx)
+                    if isinstance(cell.value, (int, float)):
+                        try:
+                            cell.value = round(cell.value, 0)
+                        except Exception:
+                            pass
+                        cell.number_format = '0'
+
+            for column_cells in worksheet.columns:
+                max_length = 0
+                column_letter = column_cells[0].column_letter
+
+                for cell in column_cells:
+                    try:
+                        cell_length = len(str(cell.value)) if cell.value is not None else 0
+                        if cell_length > max_length:
+                            max_length = cell_length
+                    except Exception:
+                        pass
+
+                worksheet.column_dimensions[column_letter].width = min(max_length + 2, 45)
+
+    output.seek(0)
+    return output
+
+
+def build_grouped_resource_export(resource_export):
+    grouped_rows = []
+    columns = list(resource_export.columns)
+
+    for project_name, group in resource_export.groupby("Project", sort=True):
+        project_header = {col: "" for col in columns}
+        project_header["Project"] = f"PROJECT: {project_name}"
+        grouped_rows.append(project_header)
+
+        # Sort rows within each project by Action Reason priority
+        sort_order = ["No Assessment", "Below Target", "Meeting Target"]
+        g = group.copy()
+        if "Action Reason" in g.columns:
+            g["Action Reason Order"] = pd.Categorical(
+                g["Action Reason"], categories=sort_order, ordered=True
+            )
+            # Rows with specified categories appear first in the defined order; others follow
+            g = g.sort_values(by=["Action Reason Order"], na_position="last")
+            g = g.drop(columns=["Action Reason Order"])
+
+        # append sorted rows
+        grouped_rows.extend(g.to_dict("records"))
+
+    return pd.DataFrame(grouped_rows, columns=columns)
+
+
+# Prepare export dataframes
+summary_df = pd.DataFrame(
+    [
+        {
+            "Business Group": scope_label,
+            "Assessment Scope": selected_skill_type,
+            "Total Resources": total_resources,
+            "Assessed Resources": assessed_resources,
+            "Completion %": round(completion_pct, 0),
+            "Target Compliance %": round(target_compliance_pct, 0),
+            "No Assessment": no_assessment,
+            "Below Target": below_target_resources,
+        }
+    ]
+)
+
+project_export_cols = [
+    "Project",
+    "TotalResources",
+    "No Assessment",
+    "Below Target Only",
+    "Resources To Chase",
+    "Chase %",
+    "Completion %",
+    "Target Compliance %",
+    "Priority Score",
+]
+
+project_export = pd.DataFrame()
+if 'project_rank' in globals():
+    project_export = project_rank.reindex(columns=project_export_cols).copy()
+
+# Resource export: use displayed names and a conservative column set
+resource_export = resource_df.rename(
+    columns={
+        "SkillName": "Primary Skill",
+        "career_level_num": "Career Level",
+        "ActionReason": "Action Reason",
+    }
+)
+
+# select conservative columns if present
+desired_cols = ["EID", "Project", "Primary Skill", "Career Level", "Target", "Actual", "Action Reason"]
+resource_export = resource_export[[c for c in desired_cols if c in resource_export.columns]]
+
+# Enforce Action Reason ordering for exports and sort per-project by Action Reason then Career Level (high->low)
+action_sort_order = {
+    "No Assessment": 1,
+    "Below Target": 2,
+    "Meeting Target": 3,
+}
+
+if "Action Reason" in resource_export.columns:
+    resource_export["Action Sort"] = (
+        resource_export["Action Reason"].map(action_sort_order).fillna(99)
     )
 
-    st.download_button(
-        "Download People Lead Follow-up Excel",
-        data=excel_output,
-        file_name="mycompetency_people_lead_followup_pack.xlsx",
-        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    # ensure numeric career level sort key
+    if "Career Level" in resource_export.columns:
+        resource_export["_career_level_sort"] = pd.to_numeric(resource_export["Career Level"], errors="coerce")
+    else:
+        resource_export["_career_level_sort"] = pd.NA
+
+    resource_export = resource_export.sort_values(
+        by=["Project", "Action Sort", "_career_level_sort", "Primary Skill", "EID"],
+        ascending=[True, True, True, True, True],
+        na_position="last",
     )
+
+    resource_export = resource_export.drop(columns=["Action Sort", "_career_level_sort"], errors="ignore")
+
+skill_export = skill_gap[
+    [
+        "SkillName",
+        "TotalResources",
+        "NoAssessment",
+        "BelowTargetOnly",
+        "Resources To Chase",
+        "Target Gap %",
+        "Priority Score",
+    ]
+].copy()
+
+skill_export = skill_export.rename(columns={"SkillName": "Primary Skill", "NoAssessment": "No Assessment", "BelowTargetOnly": "Below Target Only"})
+
+career_export = career_summary[
+    [
+        "Career Level",
+        "Total Resources",
+        "No Assessment",
+        "Completion %",
+        "Target Compliance %",
+        "Below Target",
+    ]
+].copy()
+
+resource_export_grouped = build_grouped_resource_export(resource_export)
+
+excel_output = create_chase_excel(
+    summary_df=summary_df,
+    project_df=project_export,
+    resource_detail_df=resource_export_grouped,
+    skill_gap_df=skill_export,
+    career_summary_df=career_export,
+    selected_business_group=scope_label,
+    assessment_scope=selected_skill_type,
+)
+
+st.download_button(
+    "Download People Lead Follow-up Excel",
+    data=excel_output,
+    file_name="mycompetency_people_lead_followup_pack.xlsx",
+    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+)
