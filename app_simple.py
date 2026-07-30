@@ -1137,6 +1137,110 @@ skill_members_df = (
     .copy()
 )
 
+# ============================================================
+# POTENTIAL SMEs / SKILL ANCHORS
+# ============================================================
+
+# Keep a full copy before filtering to chase-only resources.
+# This section is intentionally based on declared proficiency only.
+# It should support capability planning / SME identification and should not be treated as a performance ranking.
+skill_all_members_df = skill_members_df.copy()
+
+if show_eid and "EID" in skill_all_members_df.columns:
+    potential_sme_identifier_col = "EID"
+else:
+    potential_sme_identifier_col = COL_PERSONNEL_NO
+
+potential_sme_df = skill_all_members_df[
+    skill_all_members_df["ActualProficiency"].isin([
+        "Expert eligible",
+        "P3",
+    ])
+].copy()
+
+potential_sme_order = {
+    "Expert eligible": 1,
+    "P3": 2,
+}
+
+potential_sme_df["ProficiencyOrder"] = (
+    potential_sme_df["ActualProficiency"]
+    .map(potential_sme_order)
+    .fillna(99)
+)
+
+potential_sme_df["LevelSort"] = pd.to_numeric(
+    potential_sme_df["ManagementLevel"],
+    errors="coerce"
+)
+
+potential_sme_df = potential_sme_df.sort_values(
+    by=[
+        "ProficiencyOrder",
+        "LevelSort",
+        COL_PERSONNEL_NO,
+    ],
+    ascending=[True, True, True],
+)
+
+st.markdown("### Potential SMEs / Skill Anchors")
+st.caption(
+    "Highlights practitioners with P3 or Expert eligible declared proficiency for the selected skill. "
+    "Use this for capability planning, coaching, SME identification, and delivery support. "
+    "This is not a performance ranking."
+)
+
+sme_col1, sme_col2, sme_col3 = st.columns(3)
+sme_col1.metric("Expert eligible", int((potential_sme_df["ActualProficiency"] == "Expert eligible").sum()))
+sme_col2.metric("P3", int((potential_sme_df["ActualProficiency"] == "P3").sum()))
+sme_col3.metric("Potential SMEs", int(potential_sme_df[COL_PERSONNEL_NO].nunique()))
+
+if potential_sme_df.empty:
+    st.info("No P3 or Expert eligible practitioners found for the selected skill based on the current data.")
+else:
+    potential_sme_display_cols = [
+        c
+        for c in [
+            potential_sme_identifier_col,
+            "Project",
+            "ManagementLevel",
+            "ActualProficiency",
+            "TargetProficiency",
+        ]
+        if c in potential_sme_df.columns
+    ]
+
+    potential_sme_display_df = potential_sme_df[potential_sme_display_cols].copy()
+    potential_sme_display_df = potential_sme_display_df.rename(
+        columns={
+            "Project": "Project",
+            "ManagementLevel": "Level",
+            "ActualProficiency": "Declared Proficiency",
+            "TargetProficiency": "Target Proficiency",
+        }
+    )
+
+    st.dataframe(
+        potential_sme_display_df,
+        use_container_width=True,
+        hide_index=True,
+    )
+
+    potential_sme_csv = potential_sme_display_df.to_csv(index=False).encode("utf-8")
+    safe_selected_skill = (
+        selected_skill
+        .replace("/", "_")
+        .replace("\\", "_")
+        .replace(" ", "_")
+    )
+    st.download_button(
+        label="Download Potential SMEs CSV",
+        data=potential_sme_csv,
+        file_name=f"myCompetency_{safe_selected_skill}_Potential_SMEs.csv",
+        mime="text/csv",
+        key="download_potential_smes_csv",
+    )
+
 # Keep only resources to chase
 skill_members_df = skill_members_df[
     skill_members_df["ActionReason"].isin(
