@@ -1,3 +1,4 @@
+import io
 import os
 import re
 import pandas as pd
@@ -271,19 +272,17 @@ def build_data(master_source, result_source, selected_business_group, selected_s
 
         level = int(level)
 
-        # CL12 and CL11 target = P2
-        # In the new scale:
-        # P1 = 0
-        # P2 = 1
-        # P3 = 2
-        # Expert Eligible = 3
+        # Raw proficiency scale in the dump file:
+        # P0 = -1, P1 = 0, P2 = 1, P3 = 2, Expert Eligible = 3
+        #
+        # Business rules:
+        #   CL11 / CL12  → must reach P2  → raw value 1
+        #   CL10 and below → must reach P3 → raw value 2
         if level in [11, 12]:
-            return 2
+            return 1   # P2 in raw scale
 
-        # CL10 and up target = P3
-        # "up" means CL10, CL9, CL8, etc.
         if level <= 10:
-            return 3
+            return 2   # P3 in raw scale
 
         return None
 
@@ -407,11 +406,35 @@ def parse_snapshot_date_from_filename(filename):
     )
 
     if match:
-        day = int(match.group(1))
-        month = int(match.group(2))
+        first = int(match.group(1))
+        second = int(match.group(2))
         year = int(match.group(3))
 
-        return datetime(year, month, day)
+        # Try both orderings and pick the one that makes chronological sense.
+        # All known dumps are from mid-2026 onward, so we use a floor of
+        # May 2026 to disambiguate ambiguous cases like Dump_09_03_2026
+        # (Mar 9 DD_MM vs Sep 3 MM_DD — Sep is correct here).
+        EARLIEST_EXPECTED = datetime(year, 5, 1)  # May of the same year
+
+        # Candidate A: DD_MM_YYYY (historic default for most files)
+        try:
+            candidate_a = datetime(year, second, first)   # month=second, day=first
+        except ValueError:
+            candidate_a = None
+
+        # Candidate B: MM_DD_YYYY (used when day part > 12)
+        try:
+            candidate_b = datetime(year, first, second)   # month=first, day=second
+        except ValueError:
+            candidate_b = None
+
+        # Prefer A (DD_MM) when it falls on/after the floor; otherwise try B.
+        if candidate_a is not None and candidate_a >= EARLIEST_EXPECTED:
+            return candidate_a
+        if candidate_b is not None and candidate_b >= EARLIEST_EXPECTED:
+            return candidate_b
+        # Fall back to whichever is valid
+        return candidate_a or candidate_b
 
     return None
 
@@ -460,6 +483,125 @@ def calculate_scorecard_from_resource_df(resource_df):
         "Completion %": round(completion_pct, 1),
         "Compliance %": round(compliance_pct, 1),
     }
+
+
+def normalize_proficiency_label(proficiency_value, proficiency_desc=None):
+    if pd.notna(proficiency_desc):
+        text = str(proficiency_desc).strip().upper()
+
+        if text.startswith("P0"):
+            return "P0"
+        if text.startswith("P1"):
+            return "P1"
+        if text.startswith("P2"):
+            return "P2"
+        if text.startswith("P3"):
+            return "P3"
+        if "EXPERT" in text:
+            return "Expert Eligible"
+
+    if pd.notna(proficiency_value):
+        num = pd.to_numeric(proficiency_value, errors="coerce")
+        if not pd.isna(num):
+            num = int(num)
+            if num == 0:
+                return "P0"
+            if num == 1:
+                return "P1"
+            if num == 2:
+                return "P2"
+            if num == 3:
+                return "P3"
+            if num >= 4:
+                return "Expert Eligible"
+
+    return "Unknown"
+
+
+@st.cache_data
+def build_proficiency_history(dump_folder, master_source, selected_business_group, selected_skill_type):
+    dump_files = get_valid_dump_files(dump_folder)
+    snapshot_rows = []
+
+    for dump_file in dump_files:
+        snapshot_date = parse_snapshot_date_from_filename(dump_file)
+        if snapshot_date is None:
+            continue
+
+        merged_df, _ = build_data(
+            master_source,
+            dump_file,
+            selected_business_group,
+            selected_skill_type,
+        )
+
+        if merged_df.empty:
+            continue
+
+        merged_df["Snapshot Date"] = snapshot_date
+        merged_df["Proficiency Label"] = merged_df.apply(
+            lambda row: normalize_proficiency_label(
+                row.get("Result Proficiency"),
+                row.get("Result Proficiency Description"),
+            ),
+            axis=1,
+        )
+
+        assessed_df = merged_df[merged_df["has_assessment"]].copy()
+        if assessed_df.empty:
+            continue
+
+        counts = (
+            assessed_df
+            .groupby(["Snapshot Date", "Proficiency Label"], as_index=False)
+            .size()
+            .rename(columns={"size": "Count"})
+        )
+
+        totals = (
+            assessed_df
+            .groupby("Snapshot Date", as_index=False)
+            .size()
+            .rename(columns={"size": "Total"})
+        )
+
+        counts = counts.merge(totals, on="Snapshot Date", how="left")
+        counts["Percent"] = counts["Count"] / counts["Total"] * 100
+        counts["Snapshot Month"] = counts["Snapshot Date"].dt.to_period("M").dt.to_timestamp("M")
+
+        snapshot_rows.append(counts)
+
+    if not snapshot_rows:
+        return pd.DataFrame()
+
+    history_df = pd.concat(snapshot_rows, ignore_index=True)
+    history_df = history_df.sort_values(["Snapshot Date", "Proficiency Label"])
+    return history_df
+
+
+def build_monthly_proficiency_summary(history_df):
+    if history_df.empty:
+        return pd.DataFrame()
+
+    latest_monthly = (
+        history_df
+        .sort_values(["Snapshot Date"])
+        .groupby(["Snapshot Month", "Proficiency Label"], as_index=False)
+        .last()
+    )
+
+    pivot = latest_monthly.pivot(
+        index="Snapshot Month",
+        columns="Proficiency Label",
+        values="Percent",
+    ).fillna(0)
+
+    for label in ["P0", "P1", "P2", "P3", "Expert Eligible"]:
+        if label not in pivot.columns:
+            pivot[label] = 0
+
+    pivot = pivot.sort_index()
+    return pivot
 
 
 # ============================================================
@@ -581,6 +723,10 @@ else:
 # DISPLAY SUMMARY
 # ============================================================
 
+# Initialise so downstream module-level code never hits NameError
+success_df = pd.DataFrame()
+trend_df = pd.DataFrame()
+
 if history_df.empty:
     st.warning("No historical summary data available yet.")
 
@@ -690,6 +836,125 @@ else:
                 f"{compliance_delta:.1f}%"
             )
 
+        # ============================================================
+        # PROFICIENCY HISTORY PER MONTH
+        # ============================================================
+
+        proficiency_history_df = build_proficiency_history(
+            HISTORY_FOLDER,
+            DEFAULT_MASTER_FILE,
+            selected_business_group,
+            selected_skill_type,
+        )
+
+        if not proficiency_history_df.empty:
+            proficiency_history_df["Snapshot Month"] = pd.to_datetime(
+                proficiency_history_df["Snapshot Month"],
+                errors="coerce"
+            )
+
+            monthly_summary = build_monthly_proficiency_summary(
+                proficiency_history_df
+            )
+
+            if not monthly_summary.empty:
+                st.subheader("Monthly Proficiency Distribution")
+
+                monthly_display = monthly_summary.copy()
+                monthly_display.index = monthly_display.index.strftime("%b %Y")
+
+                st.line_chart(monthly_display[
+                    [col for col in ["P0", "P1", "P2", "P3", "Expert Eligible"] if col in monthly_display.columns]
+                ])
+
+                st.dataframe(
+                    monthly_display.reset_index().rename(
+                        columns={"index": "Month"}
+                    ),
+                    width="stretch"
+                )
+
+                delta_df = monthly_summary.diff()
+                if len(delta_df) >= 1:
+                    delta_df.iloc[0] = pd.NA
+
+                delta_df = delta_df.round(1)
+                delta_display = delta_df.copy()
+                delta_display.index = delta_display.index.strftime("%b %Y")
+
+                def proficiency_shift_style(data):
+                    styles = pd.DataFrame("", index=data.index, columns=data.columns)
+                    for col in data.columns:
+                        for idx in data.index:
+                            value = data.loc[idx, col]
+                            if pd.isna(value):
+                                styles.loc[idx, col] = ""
+                                continue
+
+                            if col in ["P0", "P1"]:
+                                if value < 0:
+                                    styles.loc[idx, col] = "color: #16a34a"
+                                elif value > 0:
+                                    styles.loc[idx, col] = "color: #d97706"
+                            elif col in ["P3", "Expert Eligible"]:
+                                if value > 0:
+                                    styles.loc[idx, col] = "color: #16a34a"
+                                elif value < 0:
+                                    styles.loc[idx, col] = "color: #d97706"
+                            else:
+                                styles.loc[idx, col] = "color: #6b7280"
+                    return styles
+
+                styled_delta = (
+                    delta_display
+                    .reset_index()
+                    .rename(columns={"index": "Month"})
+                    .style
+                    .format("{:+.1f}%", subset=delta_display.columns)
+                    .apply(proficiency_shift_style, axis=None)
+                )
+
+                st.subheader("Month-over-month Proficiency Distribution Shift")
+                st.caption(
+                    "June 2026 serves as the baseline month. Month-over-month changes begin in July 2026. "
+                    "Negative values indicate a decrease in that proficiency bucket versus the previous month. "
+                    "For lower proficiency levels such as P0/P1, a decrease may indicate positive progression when higher proficiency levels increase."
+                )
+                st.dataframe(styled_delta, width="stretch")
+
+                if len(delta_df) >= 2:
+                    latest_delta = delta_df.iloc[-1]
+                    positive_high = [
+                        label for label in ["P3", "Expert Eligible"]
+                        if label in latest_delta and pd.notna(latest_delta[label]) and latest_delta[label] > 0
+                    ]
+                    negative_low = [
+                        label for label in ["P0", "P1"]
+                        if label in latest_delta and pd.notna(latest_delta[label]) and latest_delta[label] < 0
+                    ]
+                    phrases = []
+                    if positive_high:
+                        phrases.append(
+                            f"{', '.join(positive_high)} increased"
+                        )
+                    if negative_low:
+                        phrases.append(
+                            f"{', '.join(negative_low)} decreased"
+                        )
+
+                    if phrases:
+                        st.write(
+                            f"Latest snapshot shows continued movement: {' and '.join(phrases)} versus the previous month."
+                        )
+                    else:
+                        st.write(
+                            "Latest snapshot shows mixed proficiency movement versus the previous month."
+                        )
+        else:
+            st.info(
+                "No proficiency assessment history is available from the dump files for the selected filters."
+            )
+
     # ========================================================
     # FAILED FILES SECTION
     # ========================================================
@@ -712,18 +977,28 @@ else:
         )
 
 
-# Make sure Snapshot Date exists
-history_df["Snapshot Date"] = pd.to_datetime(
-    history_df["Snapshot"],
-    errors="coerce"
-)
+# Make sure Snapshot Date exists — only if history_df has data
+if not history_df.empty:
+    # Reconstruct "Snapshot" label if the saved file predates that column
+    if "Snapshot" not in history_df.columns:
+        def _snapshot_label(row):
+            try:
+                return pd.to_datetime(row["Snapshot Date"]).strftime("%b %d, %Y")
+            except Exception:
+                return str(row.get("Source File", ""))
+        history_df["Snapshot"] = history_df.apply(_snapshot_label, axis=1)
 
-history_df = history_df.sort_values("Snapshot Date").reset_index(drop=True)
+    history_df["Snapshot Date"] = pd.to_datetime(
+        history_df["Snapshot Date"],
+        errors="coerce"
+    )
 
-# Create numeric day index from first snapshot
-history_df["DaysFromStart"] = (
-    history_df["Snapshot Date"] - history_df["Snapshot Date"].min()
-).dt.days
+    history_df = history_df.sort_values("Snapshot Date").reset_index(drop=True)
+
+    # Create numeric day index from first snapshot
+    history_df["DaysFromStart"] = (
+        history_df["Snapshot Date"] - history_df["Snapshot Date"].min()
+    ).dt.days
 
 
 
@@ -766,15 +1041,19 @@ def forecast_next_value(df, metric_col):
     return round(forecast_value, 1)
 
 
-forecast_completion = forecast_next_value(
-    success_df,
-    "Completion %"
-)
+if not success_df.empty:
+    forecast_completion = forecast_next_value(
+        success_df,
+        "Completion %"
+    )
 
-forecast_compliance = forecast_next_value(
-    success_df,
-    "Compliance %"
-)
+    forecast_compliance = forecast_next_value(
+        success_df,
+        "Compliance %"
+    )
+else:
+    forecast_completion = None
+    forecast_compliance = None
 
 
 
@@ -853,17 +1132,23 @@ def project_value_at_target_date(df, metric_col, target_date):
     return round(projected_value, 1), slope
 
 
-projected_completion, completion_rate = project_value_at_target_date(
-    trend_df,
-    "Completion %",
-    TARGET_DATE
-)
+if not trend_df.empty:
+    projected_completion, completion_rate = project_value_at_target_date(
+        trend_df,
+        "Completion %",
+        TARGET_DATE
+    )
 
-projected_compliance, compliance_rate = project_value_at_target_date(
-    trend_df,
-    "Compliance %",
-    TARGET_DATE
-)
+    projected_compliance, compliance_rate = project_value_at_target_date(
+        trend_df,
+        "Compliance %",
+        TARGET_DATE
+    )
+else:
+    projected_completion = None
+    completion_rate = None
+    projected_compliance = None
+    compliance_rate = None
 
 
 completion_gap = (
@@ -917,10 +1202,12 @@ col5.metric(
     else "N/A"
 )
 
-col6.metric(
-    "Days Remaining to Target Date",
+_days_remaining = (
     f"{(TARGET_DATE - trend_df['Snapshot Date'].max()).days} days"
+    if not trend_df.empty and "Snapshot Date" in trend_df.columns
+    else "N/A"
 )
+col6.metric("Days Remaining to Target Date", _days_remaining)
 
 
 st.caption(

@@ -2,61 +2,72 @@ import io
 import pandas as pd
 import streamlit as st
 import plotly.express as px
+from io import BytesIO
+import matplotlib.pyplot as plt
+from openpyxl.drawing.image import Image as ExcelImage
+from openpyxl.styles import Font, PatternFill, Alignment
+
+
+
 
 # ============================================================
 # CONFIG
 # ============================================================
 
-DEFAULT_SKILLS_FILE = "input/skills_dump.xlsx"
-DEFAULT_TARGET_FILE = "input/career_level_targets.xlsx"
-DEFAULT_PROJECT_FILE = "input/project_lookup.xlsx"
+DEFAULT_SOURCE_FILE = "input/MyC_Report_as_of_2026_07_22_Tech_.xlsx"
+DEFAULT_RESULT_FILE = "input/Dump_20_7_2026.xlsx"
+
+DETAILS_SHEET_NAME = "Details"
 
 ALLOWED_BUSINESS_GROUPS = [
     "Tech_Song",
     "Tech_Adobe Platform",
 ]
 
-SKILL_TYPE_FILTER = "Primary"
-DEFAULT_MIN_PROJECT_RESOURCES = 5
-
-# Skills dump columns
-COL_RESOURCE_ID = "Peoplekey"
-COL_CAREER_LEVEL_FROM_DUMP = "Career level"
+# Main dump columns
+COL_RESOURCE_ID = "Personnel No"
+COL_ENTERPRISE_ID = "Enterpriseid"
+COL_MANAGEMENT_LEVEL = "Management Level"
 COL_SKILL_NAME = "SkillName"
 COL_BUSINESS_GROUP = "Business Group"
 COL_PROFICIENCY = "proficiency"
 COL_SKILL_TYPE = "Skill type"
+COL_PROJECT = "Project Name"
 
-# Target reference columns
-TARGET_LEVEL_CODE_COL = "Career Level Code"
-TARGET_LEVEL_COL = "Career Level"
-TARGET_PROFICIENCY_COL = "Target Proficiency"
+SKILL_TYPE_FILTER = "Primary"
 
-# Project lookup columns
-PROJECT_PEOPLEKEY_COL = "PeopleKey"
-PROJECT_NAME_COL = "Project Name"
-PROJECT_BUSINESS_GROUP_COL = "Business Group"
+# Optional target/pass columns in new dump
+POSSIBLE_TARGET_COLUMNS = [
+    "Target Proficiency ID",
+    "Target Proficiency",
+    "Required Proficiency ID",
+    "Required Proficiency",
+]
 
-REQUIRED_SKILLS_COLUMNS = [
+POSSIBLE_PASS_COLUMNS = [
+    "Meets Target",
+    "Passed",
+    "Is Passed",
+    "Pass",
+]
+
+REQUIRED_SOURCE_COLUMNS = [
     COL_RESOURCE_ID,
-    COL_CAREER_LEVEL_FROM_DUMP,
+    COL_ENTERPRISE_ID,
+    COL_MANAGEMENT_LEVEL,
     COL_SKILL_NAME,
     COL_BUSINESS_GROUP,
-    COL_PROFICIENCY,
     COL_SKILL_TYPE,
+    COL_PROJECT,
 ]
 
-REQUIRED_TARGET_COLUMNS = [
-    TARGET_LEVEL_CODE_COL,
-    TARGET_LEVEL_COL,
-    TARGET_PROFICIENCY_COL,
+REQUIRED_RESULT_COLUMNS = [
+    COL_ENTERPRISE_ID,
+    COL_SKILL_NAME,
+    COL_PROFICIENCY,
 ]
 
-REQUIRED_PROJECT_COLUMNS = [
-    PROJECT_PEOPLEKEY_COL,
-    PROJECT_NAME_COL,
-    PROJECT_BUSINESS_GROUP_COL,
-]
+source = DEFAULT_SOURCE_FILE
 
 
 # ============================================================
@@ -84,6 +95,34 @@ def source_to_excel_io(source):
 
 def read_excel_normal(source):
     return pd.read_excel(source_to_excel_io(source))
+
+
+def read_details_sheet(source):
+    return pd.read_excel(
+        source_to_excel_io(source),
+        sheet_name=DETAILS_SHEET_NAME,
+        header=1,
+    )
+
+
+def read_excel_flexible(source, required_headers, file_label):
+    """
+    Reads either the new Details sheet export or a normal/detected-header workbook.
+    """
+    try:
+        df = read_details_sheet(source)
+        df = clean_column_names(df)
+        validate_columns(df, required_headers, file_label)
+        return df
+    except Exception:
+        try:
+            df = read_excel_detect_header(source, required_headers, file_label)
+            return df
+        except Exception:
+            df = read_excel_normal(source)
+            df = clean_column_names(df)
+            validate_columns(df, required_headers, file_label)
+            return df
 
 
 def find_column(df, expected_name):
@@ -193,7 +232,21 @@ def proficiency_label(value):
     if pd.isna(value):
         return "No Assessment"
 
-    return f"P{int(value)}"
+    try:
+        value = int(value)
+
+        proficiency_map = {
+            -1: "P0",
+            0: "P1",
+            1: "P2",
+            2: "P3",
+            3: "Expert Eligible",
+        }
+
+        return proficiency_map.get(value, f"P{value}")
+
+    except Exception:
+        return "No Assessment"
 
 
 def safe_pct(numerator, denominator):
@@ -231,241 +284,576 @@ def distinct_count_where(df, condition, id_col):
     return df.loc[condition, id_col].nunique()
 
 
+
+def create_chase_excel(
+    summary_df,
+    project_df,
+    resource_detail_df,
+    skill_gap_df,
+    career_summary_df,
+    selected_business_group,
+    assessment_scope,
+):
+    output = BytesIO()
+
+    with pd.ExcelWriter(output, engine="openpyxl") as writer:
+        # ------------------------------------------------------------
+        # Write sheets
+        # ------------------------------------------------------------
+        summary_df.to_excel(
+            writer,
+            sheet_name="Executive Summary",
+            index=False,
+            startrow=0,
+        )
+
+        project_df.to_excel(
+            writer,
+            sheet_name="Project Action Summary",
+            index=False,
+        )
+
+        resource_detail_df.to_excel(
+            writer,
+            sheet_name="Resource Chase Detail",
+            index=False,
+        )
+
+        skill_gap_df.to_excel(
+            writer,
+            sheet_name="Skill Gap Summary",
+            index=False,
+        )
+
+        career_summary_df.to_excel(
+            writer,
+            sheet_name="Career Level Health",
+            index=False,
+        )
+
+        workbook = writer.book
+        ws = writer.sheets["Executive Summary"]
+        from openpyxl.styles import Font, PatternFill, Alignment
+
+        # Style Executive Summary row 1 and row 2
+        header_fill = PatternFill(
+            fill_type="solid",
+            fgColor="D9EAF7"
+        )
+
+        value_fill = PatternFill(
+            fill_type="solid",
+            fgColor="F3F8FC"
+        )
+
+        for cell in ws[1]:
+            cell.font = Font(
+                bold=True,
+                size=13
+            )
+            cell.fill = header_fill
+            cell.alignment = Alignment(
+                horizontal="center",
+                vertical="center",
+                wrap_text=True
+            )
+
+        for cell in ws[2]:
+            cell.font = Font(
+                bold=True,
+                size=13
+            )
+            cell.fill = value_fill
+            cell.alignment = Alignment(
+                horizontal="center",
+                vertical="center",
+                wrap_text=True
+            )
+
+        ws.row_dimensions[1].height = 24
+        ws.row_dimensions[2].height = 24
+
+
+        # ------------------------------------------------------------
+        # Add metric definitions in same Executive Summary sheet
+        # ------------------------------------------------------------
+        definitions = [
+            ["Metric", "Meaning"],
+            ["Business Group", "Business group included in the analysis, such as Tech_Song, Tech_Adobe Platform, or All."],
+            ["Assessment Scope", "Indicates whether the analysis includes Primary Skills, Secondary Skills, or All Skills."],
+            ["Total Resources", "Total unique resources included in the selected business group and assessment scope."],
+            ["Assessed Resources", "Resources with a completed competency assessment."],
+            ["Completion %", "Percentage of resources with completed assessments. Formula: Assessed Resources / Total Resources x 100."],
+            ["Target Compliance %", "Percentage of resources meeting or exceeding the required target proficiency."],
+            ["No Assessment", "Resources without a completed competency assessment. These require assessment completion follow-up."],
+            ["Below Target", "Resources who completed an assessment but are below the required target proficiency. These require capability uplift, learning, coaching, or reassessment action."],
+        ]
+
+        # Put definitions starting row 5 para hindi matatamaan yung summary
+        start_row = 5
+
+        for r_idx, row in enumerate(definitions, start=start_row):
+            for c_idx, value in enumerate(row, start=1):
+                ws.cell(row=r_idx, column=c_idx, value=value)
+
+        # ------------------------------------------------------------
+        # Create Top Projects chart as image
+        # ------------------------------------------------------------
+        chart_start_row = start_row + len(definitions) + 3
+
+        try:
+            top_projects = (
+                project_df
+                .sort_values("Resources To Chase", ascending=False)
+                .head(10)
+                .copy()
+            )
+
+            if len(top_projects) > 0:
+                plt.figure(figsize=(10, 6))
+                plt.barh(
+                    top_projects["Project"],
+                    top_projects["Resources To Chase"],
+                )
+                plt.xlabel("Resources To Chase")
+                plt.ylabel("Project")
+                plt.title("Top Projects With Most Resources To Chase")
+                plt.gca().invert_yaxis()
+                plt.tight_layout()
+
+                chart_path = "top_projects_chart.png"
+                plt.savefig(chart_path, dpi=150)
+                plt.close()
+
+                img = ExcelImage(chart_path)
+                img.width = 720
+                img.height = 420
+
+                ws.add_image(img, f"A{chart_start_row}")
+
+        except Exception:
+            # Do not fail Excel generation if chart creation fails
+            ws.cell(
+                row=chart_start_row,
+                column=1,
+                value="Chart could not be generated. Please refer to Project Action Summary tab.",
+            )
+
+        # ------------------------------------------------------------
+        # Basic formatting
+        # ------------------------------------------------------------
+        for sheet_name in writer.sheets:
+            worksheet = writer.sheets[sheet_name]
+            if sheet_name == "Resource Chase Detail":
+                project_header_fill = PatternFill(
+                    fill_type="solid",
+                    fgColor="BDD7EE"
+                )
+
+                for row in range(2, worksheet.max_row + 1):
+                    project_value = worksheet.cell(row=row, column=2).value
+
+                    if isinstance(project_value, str) and project_value.startswith("PROJECT:"):
+                        for col in range(1, worksheet.max_column + 1):
+                            cell = worksheet.cell(row=row, column=col)
+                            cell.font = Font(bold=True, size=12)
+                            cell.fill = project_header_fill
+                            cell.alignment = Alignment(horizontal="left", vertical="center")
+
+                        worksheet.row_dimensions[row].height = 22
+            worksheet.freeze_panes = "A2"
+
+            for column_cells in worksheet.columns:
+                max_length = 0
+                column_letter = column_cells[0].column_letter
+
+                for cell in column_cells:
+                    try:
+                        cell_length = len(str(cell.value)) if cell.value is not None else 0
+                        if cell_length > max_length:
+                            max_length = cell_length
+                    except Exception:
+                        pass
+
+                worksheet.column_dimensions[column_letter].width = min(max_length + 2, 45)
+
+    output.seek(0)
+    return output
+
+def build_grouped_resource_export(resource_export):
+    grouped_rows = []
+    columns = list(resource_export.columns)
+
+    for project_name, group in resource_export.groupby("Project", sort=True):
+        project_header = {col: "" for col in columns}
+        project_header["Project"] = f"PROJECT: {project_name}"
+        grouped_rows.append(project_header)
+
+        grouped_rows.extend(group.to_dict("records"))
+
+    return pd.DataFrame(grouped_rows, columns=columns)
+
+def find_optional_column(df, possible_names):
+    normalized_lookup = {
+        normalize_col_name(col): col
+        for col in df.columns
+    }
+
+    for name in possible_names:
+        normalized_name = normalize_col_name(name)
+
+        if normalized_name in normalized_lookup:
+            return normalized_lookup[normalized_name]
+
+    return None
+
+def read_details_detect_header(source, required_headers, file_label):
+    """
+    Reads the Details sheet and automatically detects the row containing the real headers.
+    This is needed because the new myCompetency export has grouped header rows above the actual columns.
+    """
+
+    raw = pd.read_excel(
+        source_to_excel_io(source),
+        sheet_name=DETAILS_SHEET_NAME,
+        header=None,
+    )
+
+    required_normalized = [
+        normalize_col_name(h)
+        for h in required_headers
+    ]
+
+    header_row_index = None
+
+    for idx, row in raw.iterrows():
+        row_values = [
+            normalize_col_name(x)
+            for x in row.tolist()
+        ]
+
+        if all(req in row_values for req in required_normalized):
+            header_row_index = idx
+            break
+
+    if header_row_index is None:
+        raise ValueError(
+            f"Could not detect header row for {file_label} in sheet '{DETAILS_SHEET_NAME}'. "
+            f"Required headers: {required_headers}"
+        )
+
+    df = pd.read_excel(
+        source_to_excel_io(source),
+        sheet_name=DETAILS_SHEET_NAME,
+        header=header_row_index,
+    )
+
+    df = clean_column_names(df)
+
+    validate_columns(
+        df,
+        required_headers,
+        file_label,
+    )
+
+    return df
+
 # ============================================================
 # DATA PIPELINE
 # ============================================================
 
-@st.cache_data(show_spinner=False)
-def build_data(skills_source, target_source, project_source, selected_business_group):
 
+@st.cache_data
+def build_data(master_source, result_source, selected_business_group, skill_type_filter):
     allowed_bg_upper = [bg.upper() for bg in ALLOWED_BUSINESS_GROUPS]
 
     # ---------------------------
-    # Load skills dump
+    # Load master/source-of-truth file
     # ---------------------------
-    skills_df = read_excel_normal(skills_source)
-    skills_df = clean_column_names(skills_df)
-    validate_columns(skills_df, REQUIRED_SKILLS_COLUMNS, "Skills Dump")
-
-    actual_resource_col = find_column(skills_df, COL_RESOURCE_ID)
-    actual_career_col = find_column(skills_df, COL_CAREER_LEVEL_FROM_DUMP)
-    actual_skill_col = find_column(skills_df, COL_SKILL_NAME)
-    actual_bg_col = find_column(skills_df, COL_BUSINESS_GROUP)
-    actual_prof_col = find_column(skills_df, COL_PROFICIENCY)
-    actual_skill_type_col = find_column(skills_df, COL_SKILL_TYPE)
-
-    skills_df = skills_df.rename(
-        columns={
-            actual_resource_col: COL_RESOURCE_ID,
-            actual_career_col: COL_CAREER_LEVEL_FROM_DUMP,
-            actual_skill_col: COL_SKILL_NAME,
-            actual_bg_col: COL_BUSINESS_GROUP,
-            actual_prof_col: COL_PROFICIENCY,
-            actual_skill_type_col: COL_SKILL_TYPE,
-        }
+    master_df = read_excel_flexible(
+        master_source,
+        REQUIRED_SOURCE_COLUMNS,
+        "Master Source File",
     )
 
-    skills_df["Business Group Clean"] = (
-        skills_df[COL_BUSINESS_GROUP]
+    actual_resource_col = find_column(master_df, COL_RESOURCE_ID)
+    actual_eid_col = find_column(master_df, COL_ENTERPRISE_ID)
+    actual_level_col = find_column(master_df, COL_MANAGEMENT_LEVEL)
+    actual_skill_col = find_column(master_df, COL_SKILL_NAME)
+    actual_bg_col = find_column(master_df, COL_BUSINESS_GROUP)
+    actual_skill_type_col = find_column(master_df, COL_SKILL_TYPE)
+    actual_project_col = find_column(master_df, COL_PROJECT)
+
+    # Optional columns in master file
+    actual_master_prof_col = find_column(master_df, COL_PROFICIENCY)
+    actual_action_required_col = find_optional_column(master_df, ["Action Required"])
+    actual_action_required_for_col = find_optional_column(master_df, ["Action Required for"])
+    actual_target_col = find_optional_column(master_df, POSSIBLE_TARGET_COLUMNS)
+    actual_pass_col = find_optional_column(master_df, POSSIBLE_PASS_COLUMNS)
+
+    rename_map = {
+        actual_resource_col: COL_RESOURCE_ID,
+        actual_eid_col: COL_ENTERPRISE_ID,
+        actual_level_col: COL_MANAGEMENT_LEVEL,
+        actual_skill_col: COL_SKILL_NAME,
+        actual_bg_col: COL_BUSINESS_GROUP,
+        actual_skill_type_col: COL_SKILL_TYPE,
+        actual_project_col: COL_PROJECT,
+    }
+    if actual_master_prof_col is not None:
+        rename_map[actual_master_prof_col] = "Master Proficiency ID"
+    if actual_action_required_col is not None:
+        rename_map[actual_action_required_col] = "Action Required"
+    if actual_action_required_for_col is not None:
+        rename_map[actual_action_required_for_col] = "Action Required for"
+    if actual_target_col is not None:
+        rename_map[actual_target_col] = "Target Proficiency Raw"
+    if actual_pass_col is not None:
+        rename_map[actual_pass_col] = "Pass Raw"
+
+    master_df = master_df.rename(columns=rename_map)
+
+    # ---------------------------
+    # Clean master/source columns
+    # ---------------------------
+    master_df[COL_RESOURCE_ID] = master_df[COL_RESOURCE_ID].apply(normalize_peoplekey)
+    master_df[COL_ENTERPRISE_ID] = (
+        master_df[COL_ENTERPRISE_ID]
+        .fillna("")
+        .astype(str)
+        .str.strip()
+    )
+    master_df[COL_SKILL_NAME] = (
+        master_df[COL_SKILL_NAME]
+        .fillna("")
+        .astype(str)
+        .str.strip()
+    )
+    master_df["Business Group Clean"] = (
+        master_df[COL_BUSINESS_GROUP]
+        .astype(str)
+        .str.strip()
+    )
+    master_df["Skill Type Clean"] = (
+        master_df[COL_SKILL_TYPE]
+        .astype(str)
+        .str.strip()
+    )
+    master_df["Project"] = (
+        master_df[COL_PROJECT]
+        .fillna("Unmapped")
         .astype(str)
         .str.strip()
     )
 
+    # ---------------------------
+    # Business Group filter first
+    # ---------------------------
     if selected_business_group == "All":
-        skills_df = skills_df[
-            skills_df["Business Group Clean"]
+        master_df = master_df[
+            master_df["Business Group Clean"]
             .str.upper()
             .isin(allowed_bg_upper)
         ].copy()
     else:
-        skills_df = skills_df[
-            skills_df["Business Group Clean"]
+        master_df = master_df[
+            master_df["Business Group Clean"]
             .str.upper()
             == selected_business_group.upper()
         ].copy()
 
-    if len(skills_df) == 0:
+    if len(master_df) == 0:
         raise ValueError(
-            f"Skills Dump has no records after Business Group filter: "
-            f"{selected_business_group}"
-        )
-
-    skills_df["Skill Type Clean"] = (
-        skills_df[COL_SKILL_TYPE]
-        .astype(str)
-        .str.strip()
-    )
-
-    skills_df = skills_df[
-        skills_df["Skill Type Clean"].str.upper()
-        == SKILL_TYPE_FILTER.upper()
-    ].copy()
-
-    if len(skills_df) == 0:
-        raise ValueError(
-            f"No rows found after Skill Type filter: {SKILL_TYPE_FILTER}"
+            f"No records after Business Group filter: {selected_business_group}"
         )
 
     # ---------------------------
-    # Load target lookup
+    # Skill Type filter
     # ---------------------------
-    target_df = read_excel_detect_header(
-        target_source,
-        REQUIRED_TARGET_COLUMNS,
-        "Career Level Target Lookup"
-    )
+    if skill_type_filter != "All":
+        master_df = master_df[
+            master_df["Skill Type Clean"].str.upper()
+            == skill_type_filter.upper()
+        ].copy()
 
-    actual_target_code_col = find_column(target_df, TARGET_LEVEL_CODE_COL)
-    actual_target_level_col = find_column(target_df, TARGET_LEVEL_COL)
-    actual_target_prof_col = find_column(target_df, TARGET_PROFICIENCY_COL)
-
-    target_df["career_level_code"] = target_df[actual_target_code_col].apply(parse_number)
-    target_df["career_level_num"] = target_df[actual_target_level_col].apply(parse_number)
-    target_df["target_proficiency_num"] = target_df[actual_target_prof_col].apply(parse_proficiency)
-
-    target_lookup = target_df.loc[
-        target_df["career_level_code"].notna()
-        & target_df["career_level_num"].notna()
-        & target_df["target_proficiency_num"].notna(),
-        [
-            "career_level_code",
-            "career_level_num",
-            "target_proficiency_num",
-        ],
-    ].drop_duplicates(subset=["career_level_code"]).copy()
+    if len(master_df) == 0:
+        raise ValueError(
+            f"No records after Skill Type filter: {skill_type_filter}"
+        )
 
     # ---------------------------
-    # Clean skills data and map targets
+    # Load changing proficiency result file and merge
     # ---------------------------
-    skills_df[COL_RESOURCE_ID] = skills_df[COL_RESOURCE_ID].apply(normalize_peoplekey)
-    skills_df["career_level_code"] = skills_df[COL_CAREER_LEVEL_FROM_DUMP].apply(parse_number)
-    skills_df["proficiency_num"] = skills_df[COL_PROFICIENCY].apply(parse_proficiency)
+    result_df = None
+    try:
+        result_df = read_excel_flexible(
+            result_source,
+            REQUIRED_RESULT_COLUMNS,
+            "Proficiency Result File",
+        )
+    except Exception:
+        # Fallback: if no separate result file is available yet, use proficiency in master file when present.
+        result_df = None
 
-    skills_df = skills_df.merge(
-        target_lookup,
-        on="career_level_code",
-        how="left",
-    )
+    if result_df is not None:
+        actual_result_eid_col = find_column(result_df, COL_ENTERPRISE_ID)
+        actual_result_skill_col = find_column(result_df, COL_SKILL_NAME)
 
-    skills_df["has_assessment"] = skills_df["proficiency_num"].notna()
+        actual_result_prof_col = find_optional_column(
+            result_df,
+            [
+                COL_PROFICIENCY,       # Proficiency ID
+                "proficiency",         # current result file column
+                "Proficiency",
+                "Proficiency ID",
+                "ProficiencyID",
+            ]
+        )
 
-    skills_df["meets_target"] = (
-        skills_df["proficiency_num"].notna()
-        & skills_df["target_proficiency_num"].notna()
-        & (skills_df["proficiency_num"] >= skills_df["target_proficiency_num"])
-    )
+        actual_result_prof_label_col = find_optional_column(
+            result_df,
+            [
+                "Proficiency Description",
+                "Proficiency",
+                "Proficiency Name",
+            ]
+        )
 
-    # IMPORTANT:
-    # Below target is assessed resources only.
-    # No assessment is handled separately.
-    skills_df["below_target"] = (
-        skills_df["proficiency_num"].notna()
-        & skills_df["target_proficiency_num"].notna()
-        & (skills_df["proficiency_num"] < skills_df["target_proficiency_num"])
-    )
+    if actual_result_prof_col is None:
+        raise ValueError(
+            "Could not find proficiency column in Proficiency Result File. "
+            f"Available columns: {list(result_df.columns)}"
+        )
+
+        result_rename = {
+            actual_result_eid_col: COL_ENTERPRISE_ID,
+            actual_result_skill_col: COL_SKILL_NAME,
+            actual_result_prof_col: "Result Proficiency ID",
+        }
+
+        if actual_result_prof_label_col is not None:
+            result_rename[actual_result_prof_label_col] = "Result Proficiency"
+
+        result_df = result_df.rename(columns=result_rename)
+        
+        result_df[COL_ENTERPRISE_ID] = (
+            result_df[COL_ENTERPRISE_ID]
+            .fillna("")
+            .astype(str)
+            .str.strip()
+        )
+        result_df[COL_SKILL_NAME] = (
+            result_df[COL_SKILL_NAME]
+            .fillna("")
+            .astype(str)
+            .str.strip()
+        )
+
+        result_df = result_df[
+            [c for c in [COL_ENTERPRISE_ID, COL_SKILL_NAME, "Result Proficiency", "Result Proficiency ID"] if c in result_df.columns]
+        ].drop_duplicates(subset=[COL_ENTERPRISE_ID, COL_SKILL_NAME], keep="last")
+
+        df = master_df.merge(
+            result_df,
+            on=[COL_ENTERPRISE_ID, COL_SKILL_NAME],
+            how="left",
+        )
+    else:
+        df = master_df.copy()
+        if "Master Proficiency ID" in df.columns:
+            df["Result Proficiency ID"] = df["Master Proficiency ID"]
+        else:
+            df["Result Proficiency ID"] = None
 
     # ---------------------------
-    # Build resource-level view
+    # Parse proficiency from result file
+    # ---------------------------
+    df["proficiency_num"] = df["Result Proficiency ID"].apply(parse_proficiency)
+    df["career_level_num"] = df[COL_MANAGEMENT_LEVEL].apply(parse_number)
+    df["has_assessment"] = df["proficiency_num"].notna()
+
+    # ---------------------------
+    # Target/pass logic
+    # ---------------------------
+    if "Target Proficiency Raw" in df.columns:
+        df["target_proficiency_num"] = df["Target Proficiency Raw"].apply(parse_proficiency)
+        df["meets_target"] = (
+            df["proficiency_num"].notna()
+            & df["target_proficiency_num"].notna()
+            & (df["proficiency_num"] >= df["target_proficiency_num"])
+        )
+        df["below_target"] = (
+            df["proficiency_num"].notna()
+            & df["target_proficiency_num"].notna()
+            & (df["proficiency_num"] < df["target_proficiency_num"])
+        )
+        df["target_available"] = True
+
+    elif "Pass Raw" in df.columns:
+        pass_values = df["Pass Raw"].astype(str).str.strip().str.upper()
+        df["meets_target"] = pass_values.isin(["TRUE", "YES", "Y", "PASSED", "PASS", "1"])
+        df["below_target"] = df["has_assessment"] & ~df["meets_target"]
+        df["target_proficiency_num"] = None
+        df["target_available"] = True
+
+    elif "Action Required" in df.columns:
+        action_text = df["Action Required"].fillna("").astype(str).str.strip().str.upper()
+        no_action_values = ["", "N", "NO", "FALSE", "0", "NONE", "NAN"]
+        df["below_target"] = df["has_assessment"] & ~action_text.isin(no_action_values)
+        df["meets_target"] = df["has_assessment"] & ~df["below_target"]
+        df["target_proficiency_num"] = None
+        df["target_available"] = True
+
+    else:
+        # No target/pass/action indicator available. Keep assessment completion valid but disable compliance.
+        df["target_proficiency_num"] = None
+        df["meets_target"] = False
+        df["below_target"] = False
+        df["target_available"] = False
+
+    # ---------------------------
+    # Labels
+    # ---------------------------
+    df["Target"] = (
+        df["target_proficiency_num"].apply(target_label)
+        if df["target_available"].any()
+        else "Target N/A"
+    )
+    df["Actual"] = df["proficiency_num"].apply(proficiency_label)
+    df["Action Reason"] = df.apply(action_reason, axis=1)
+
+    # ---------------------------
+    # Resource-level view
     # ---------------------------
     resource_df = (
-        skills_df
+        df
         .groupby(COL_RESOURCE_ID, as_index=False)
         .agg(
+            EID=(COL_ENTERPRISE_ID, "first"),
             business_group=("Business Group Clean", "first"),
-            career_level_code=("career_level_code", "first"),
+            management_level=(COL_MANAGEMENT_LEVEL, "first"),
             career_level_num=("career_level_num", "first"),
             primary_skill=(COL_SKILL_NAME, "first"),
+            project=("Project", "first"),
             max_proficiency_num=("proficiency_num", "max"),
             target_proficiency_num=("target_proficiency_num", "first"),
             has_assessment=("has_assessment", "max"),
+            meets_target=("meets_target", "max"),
+            below_target=("below_target", "max"),
+            target_available=("target_available", "max"),
         )
     )
 
-    resource_df["meets_target"] = (
-        resource_df["max_proficiency_num"].notna()
-        & resource_df["target_proficiency_num"].notna()
-        & (resource_df["max_proficiency_num"] >= resource_df["target_proficiency_num"])
+    resource_df["Target"] = (
+        resource_df["target_proficiency_num"].apply(target_label)
+        if resource_df["target_available"].any()
+        else "Target N/A"
     )
-
-    resource_df["below_target"] = (
-        resource_df["max_proficiency_num"].notna()
-        & resource_df["target_proficiency_num"].notna()
-        & (resource_df["max_proficiency_num"] < resource_df["target_proficiency_num"])
-    )
-
-    resource_df["Target"] = resource_df["target_proficiency_num"].apply(target_label)
     resource_df["Actual"] = resource_df["max_proficiency_num"].apply(proficiency_label)
     resource_df["Action Reason"] = resource_df.apply(action_reason, axis=1)
 
-    # ---------------------------
-    # Load project lookup
-    # ---------------------------
-    project_df = read_excel_detect_header(
-        project_source,
-        REQUIRED_PROJECT_COLUMNS,
-        "Project Lookup"
-    )
-
-    actual_project_peoplekey_col = find_column(project_df, PROJECT_PEOPLEKEY_COL)
-    actual_project_name_col = find_column(project_df, PROJECT_NAME_COL)
-    actual_project_bg_col = find_column(project_df, PROJECT_BUSINESS_GROUP_COL)
-
-    project_df = project_df.rename(
-        columns={
-            actual_project_peoplekey_col: PROJECT_PEOPLEKEY_COL,
-            actual_project_name_col: PROJECT_NAME_COL,
-            actual_project_bg_col: PROJECT_BUSINESS_GROUP_COL,
-        }
-    )
-
-    project_df[PROJECT_PEOPLEKEY_COL] = project_df[PROJECT_PEOPLEKEY_COL].apply(normalize_peoplekey)
-
-    project_df["Project Business Group Clean"] = (
-        project_df[PROJECT_BUSINESS_GROUP_COL]
-        .astype(str)
-        .str.strip()
-    )
-
-    if selected_business_group == "All":
-        project_df = project_df[
-            project_df["Project Business Group Clean"]
-            .str.upper()
-            .isin(allowed_bg_upper)
-        ].copy()
-    else:
-        project_df = project_df[
-            project_df["Project Business Group Clean"]
-            .str.upper()
-            == selected_business_group.upper()
-        ].copy()
-
-    if len(project_df) == 0:
-        raise ValueError(
-            f"Project Lookup has no records after Business Group filter: "
-            f"{selected_business_group}"
-        )
-
-    project_lookup = (
-        project_df[
-            [
-                PROJECT_PEOPLEKEY_COL,
-                PROJECT_NAME_COL,
-                PROJECT_BUSINESS_GROUP_COL,
-            ]
-        ]
-        .dropna(subset=[PROJECT_PEOPLEKEY_COL])
-        .drop_duplicates(subset=[PROJECT_PEOPLEKEY_COL])
-        .copy()
-    )
-
-    resource_project_df = resource_df.merge(
-        project_lookup,
-        left_on=COL_RESOURCE_ID,
-        right_on=PROJECT_PEOPLEKEY_COL,
-        how="left",
-    )
-
-    resource_project_df["Project"] = resource_project_df[PROJECT_NAME_COL].fillna("Unmapped")
+    resource_project_df = resource_df.copy()
+    resource_project_df["Project"] = resource_project_df["project"].fillna("Unmapped")
 
     # ---------------------------
     # Project-level view
@@ -474,27 +862,14 @@ def build_data(skills_source, target_source, project_source, selected_business_g
 
     for project_name, group in resource_project_df.groupby("Project"):
         total_resources = group[COL_RESOURCE_ID].nunique()
-        assessed_resources = distinct_count_where(
-            group,
-            group["has_assessment"] == True,
-            COL_RESOURCE_ID
-        )
-        no_assessment = distinct_count_where(
-            group,
-            group["has_assessment"] == False,
-            COL_RESOURCE_ID
-        )
+        assessed_resources = distinct_count_where(group, group["has_assessment"] == True, COL_RESOURCE_ID)
+        no_assessment = distinct_count_where(group, group["has_assessment"] == False, COL_RESOURCE_ID)
         below_target_only = distinct_count_where(
             group,
             (group["below_target"] == True) & (group["has_assessment"] == True),
-            COL_RESOURCE_ID
+            COL_RESOURCE_ID,
         )
-        meeting_target = distinct_count_where(
-            group,
-            group["meets_target"] == True,
-            COL_RESOURCE_ID
-        )
-
+        meeting_target = distinct_count_where(group, group["meets_target"] == True, COL_RESOURCE_ID)
         resources_to_chase = no_assessment + below_target_only
 
         project_summary_rows.append(
@@ -508,30 +883,24 @@ def build_data(skills_source, target_source, project_source, selected_business_g
                 "Resources To Chase": resources_to_chase,
                 "Chase %": safe_pct(resources_to_chase, total_resources),
                 "Completion %": safe_pct(assessed_resources, total_resources),
-                "Target Compliance %": safe_pct(meeting_target, total_resources),
+                "Target Proficiency Compliance %": safe_pct(meeting_target, total_resources),
                 "Priority Score": no_assessment + (below_target_only * 2),
             }
         )
 
     project_view = pd.DataFrame(project_summary_rows)
-
     if len(project_view) > 0:
-        project_view = project_view.sort_values(
-            ["Resources To Chase", "TotalResources"],
-            ascending=[False, False]
-        )
+        project_view = project_view.sort_values(["Resources To Chase", "TotalResources"], ascending=[False, False])
 
     metadata = {
-        "skills_rows_after_filters": len(skills_df),
-        "target_mappings": len(target_lookup),
-        "project_lookup_peoplekeys": project_lookup[PROJECT_PEOPLEKEY_COL].nunique(),
-        "unmapped_resources": resource_project_df[
-            resource_project_df["Project"] == "Unmapped"
-        ][COL_RESOURCE_ID].nunique(),
+        "rows_after_filters": len(df),
+        "unique_resources": df[COL_RESOURCE_ID].nunique(),
+        "unique_skills": df[COL_SKILL_NAME].nunique(),
+        "skill_type_filter": skill_type_filter,
+        "result_rows": len(result_df) if result_df is not None else 0,
     }
 
-    return skills_df, resource_df, resource_project_df, project_view, metadata
-
+    return df, resource_df, resource_project_df, project_view, metadata
 
 # ============================================================
 # STREAMLIT APP
@@ -552,16 +921,18 @@ st.info("This dashboard is based on the selected Business Group and PRIMARY skil
 # FILE UPLOADS
 # ============================================================
 
-st.sidebar.header("Data Upload")
-st.sidebar.caption("Upload the 3 Excel files. If blank, app uses local files under input/.")
+master_file = st.sidebar.file_uploader(
+    "Upload Master Source File",
+    type=["xlsx"],
+)
 
-uploaded_skills = st.sidebar.file_uploader("1. Skills Dump", type=["xlsx"], key="skills_upload")
-uploaded_target = st.sidebar.file_uploader("2. Career Level Target Lookup", type=["xlsx"], key="target_upload")
-uploaded_project = st.sidebar.file_uploader("3. Project Lookup", type=["xlsx"], key="project_upload")
+result_file = st.sidebar.file_uploader(
+    "Upload Proficiency Result File",
+    type=["xlsx"],
+)
 
-skills_source = get_source(uploaded_skills, DEFAULT_SKILLS_FILE)
-target_source = get_source(uploaded_target, DEFAULT_TARGET_FILE)
-project_source = get_source(uploaded_project, DEFAULT_PROJECT_FILE)
+source = get_source(master_file, DEFAULT_SOURCE_FILE)
+result_source = get_source(result_file, DEFAULT_RESULT_FILE)
 
 business_group_options = ["All"] + ALLOWED_BUSINESS_GROUPS
 
@@ -571,6 +942,8 @@ selected_business_group = st.sidebar.selectbox(
     index=0,
 )
 
+assessment_scope = "Primary"
+
 scorecard_scope = (
     "Tech_Song + Tech_Adobe Platform"
     if selected_business_group == "All"
@@ -578,39 +951,88 @@ scorecard_scope = (
 )
 
 with st.sidebar.expander("Expected Columns", expanded=False):
+
     st.markdown("**Skills Dump**")
-    st.code("\n".join(REQUIRED_SKILLS_COLUMNS))
+    #st.code("\n".join(REQUIRED_SKILLS_COLUMNS))
 
     st.markdown("**Career Level Target Lookup**")
-    st.code("\n".join(REQUIRED_TARGET_COLUMNS))
+    #st.code("\n".join(REQUIRED_TARGET_COLUMNS))
 
     st.markdown("**Project Lookup**")
-    st.code("\n".join(REQUIRED_PROJECT_COLUMNS))
+    #st.code("\n".join(REQUIRED_PROJECT_COLUMNS))
 
 
 # ============================================================
 # BUILD DATA
 # ============================================================
-
+skill_type_filter = "Primary"
 try:
     skills_df, resource_df, resource_project_df, project_view, metadata = build_data(
-        skills_source,
-        target_source,
-        project_source,
+        source,
+        result_source,
         selected_business_group,
+        skill_type_filter,
     )
 
     st.sidebar.success("Data loaded and validated")
     st.sidebar.caption(f"Business Group: {scorecard_scope}")
-    st.sidebar.caption(f"Filtered skill rows: {metadata['skills_rows_after_filters']:,}")
-    st.sidebar.caption(f"Target mappings: {metadata['target_mappings']:,}")
-    st.sidebar.caption(f"Project lookup peoplekeys: {metadata['project_lookup_peoplekeys']:,}")
-    st.sidebar.caption(f"Unmapped resources: {metadata['unmapped_resources']:,}")
+    st.sidebar.caption(f"Filtered skill rows: {metadata['rows_after_filters']:,}")
+    st.sidebar.caption(f"Unique resources: {metadata['unique_resources']:,}")
+    st.sidebar.caption(f"Unique skills: {metadata['unique_skills']:,}")
+    st.sidebar.caption(f"Result rows loaded: {metadata['result_rows']:,}")
 
 except Exception as e:
     st.error("Failed to load or validate input files.")
     st.exception(e)
     st.stop()
+
+
+# ------------------------------------------------------------
+# Performance: precompute canonical columns and per-project cache
+# ------------------------------------------------------------
+try:
+    # Canonical display column names (rename once)
+    resource_project_df = resource_project_df.rename(
+        columns={
+            COL_RESOURCE_ID: "Employee ID",
+            "primary_skill": "Primary Skill",
+            "career_level_num": "Career Level",
+            COL_ENTERPRISE_ID: "EID",
+        }
+    )
+
+    # Ensure Project column is populated and use categorical dtype for faster grouping
+    if "Project" in resource_project_df.columns:
+        resource_project_df["Project"] = resource_project_df["Project"].fillna("Unmapped")
+    elif "project" in resource_project_df.columns:
+        resource_project_df["Project"] = resource_project_df["project"].fillna("Unmapped")
+
+    resource_project_df["Project"] = resource_project_df["Project"].astype("category")
+
+    # Minimal columns used for drilldown to keep cached frames small
+    _DRILLDOWN_COLS = [
+        "Employee ID",
+        "Project",
+        "Primary Skill",
+        "Career Level",
+        "Target",
+        "Actual",
+        "Action Reason",
+    ]
+
+    @st.cache_data
+    def _build_project_map(df):
+        pm = {}
+        for pname, group in df.groupby("Project"):
+            # store a lightweight copy with only essential columns
+            cols = [c for c in _DRILLDOWN_COLS if c in group.columns]
+            pm[pname] = group[cols].copy()
+        return pm
+
+    project_map = _build_project_map(resource_project_df)
+except Exception:
+    # Best-effort optimization; fall back to original flow if something goes wrong
+    project_map = {}
 
 
 # ============================================================
@@ -622,7 +1044,7 @@ st.sidebar.header("Dashboard Filters")
 min_project_resources = st.sidebar.number_input(
     "Minimum project resources",
     min_value=1,
-    value=DEFAULT_MIN_PROJECT_RESOURCES,
+    value=5,
     step=1,
 )
 
@@ -767,13 +1189,13 @@ career_summary["Completion %"] = (
     career_summary["AssessedResources"]
     / career_summary["TotalResources"]
     * 100
-).round(1)
+).round(0)
 
 career_summary["Target Compliance %"] = (
     career_summary["MeetingTarget"]
     / career_summary["TotalResources"]
     * 100
-).round(1)
+).round(0)
 
 career_summary = career_summary.rename(
     columns={
@@ -868,7 +1290,8 @@ else:
                 "Target Compliance %",
                 "Priority Score",
             ]
-        ].head(50),
+        ].round(0).head(50),
+        width="stretch",
         use_container_width=True,
         hide_index=True,
     )
@@ -938,76 +1361,157 @@ try:
         )
 
         def classify_cluster(row):
-            if row["AvgPriorityScore"] >= cluster_profile["AvgPriorityScore"].quantile(0.75):
-                return "High Intervention Priority"
-            elif row["AvgNoAssessment"] >= cluster_profile["AvgNoAssessment"].quantile(0.75):
+            avg_total = row["AvgTotalResources"]
+            avg_no_assessment = row["AvgNoAssessment"]
+            avg_below_target = row["AvgBelowTarget"]
+            avg_resources_to_chase = row["AvgResourcesToChase"]
+            avg_chase_pct = row["AvgChasePct"]
+            avg_completion_pct = row["AvgCompletionPct"]
+            avg_compliance_pct = row["AvgCompliancePct"]
+            avg_priority_score = row["AvgPriorityScore"]
+
+            # --------------------------------------------------------
+            # HARD BUSINESS RULES FIRST
+            # --------------------------------------------------------
+
+            # No assessments
+            if avg_completion_pct < 50 and avg_no_assessment > 0:
                 return "Assessment Completion Gap"
-            elif row["AvgBelowTarget"] >= cluster_profile["AvgBelowTarget"].quantile(0.75):
+
+            # Severe competency issue
+            if avg_completion_pct >= 90 and avg_compliance_pct <= 20:
+                return "Severe Competency Gap"
+
+            # High completion but low compliance
+            if avg_completion_pct >= 80 and avg_compliance_pct < 50:
                 return "Competency Gap Pattern"
-            elif row["AvgCompliancePct"] <= cluster_profile["AvgCompliancePct"].quantile(0.25):
-                return "Low Target Compliance"
-            else:
+
+            # Extreme intervention
+            if avg_chase_pct >= 80 and avg_resources_to_chase >= 20:
+                return "High Intervention Priority"
+
+            # Healthy
+            if (
+                avg_resources_to_chase <= 2
+                and avg_completion_pct >= 80
+                and avg_compliance_pct >= 80
+            ):
                 return "Monitor / Relatively Healthy"
+
+            return "Moderate Intervention Watchlist"
+
+
+            # --------------------------------------------------------
+            # RELATIVE FALLBACK RULES
+            # --------------------------------------------------------
+
+            high_priority_threshold = cluster_profile["AvgPriorityScore"].quantile(0.75)
+            high_no_assessment_threshold = cluster_profile["AvgNoAssessment"].quantile(0.75)
+            high_below_target_threshold = cluster_profile["AvgBelowTarget"].quantile(0.75)
+            low_compliance_threshold = cluster_profile["AvgCompliancePct"].quantile(0.25)
+
+            if avg_priority_score >= high_priority_threshold:
+                return "High Intervention Priority"
+
+            elif avg_no_assessment >= high_no_assessment_threshold:
+                return "Assessment Completion Gap"
+
+            elif avg_below_target >= high_below_target_threshold:
+                return "Competency Gap Pattern"
+
+            elif avg_compliance_pct <= low_compliance_threshold:
+                return "Low Target Compliance"
+
+            else:
+                return "Moderate Intervention Watchlist"
+
 
         cluster_profile["Pattern Description"] = cluster_profile.apply(
             classify_cluster,
-            axis=1
-        )
+                    axis=1)
+        
 
         project_ml = project_ml.merge(
             cluster_profile[
                 [
-                    "Pattern Cluster",
-                    "Pattern Description",
+                "Pattern Cluster",
+                "Pattern Description",
                 ]
             ],
             on="Pattern Cluster",
             how="left",
+            )
+
+        st.write("Master Rows", len(master_df))
+
+        st.write("Result Rows", len(result_df))
+
+        def classify_project_action(row):
+            if row["Completion %"] == 0 and row["No Assessment"] > 0:
+                return "Assessment Completion Gap"
+
+            if row["Chase %"] >= 80:
+                return "High Intervention Priority"
+
+            if row["Completion %"] < 50 and row["No Assessment"] >= row["Below Target Only"]:
+                return "Assessment Completion Gap"
+
+            if row["Completion %"] >= 80 and row["Target Compliance %"] < 50 and row["Below Target Only"] > 0:
+                return "Competency Gap Pattern"
+
+            if row["Resources To Chase"] == 0 and row["Completion %"] >= 80 and row["Target Compliance %"] >= 80:
+                return "Monitor / Relatively Healthy"
+
+            return "Moderate Intervention Watchlist"
+
+
+        project_ml["Project Action Label"] = project_ml.apply(
+            classify_project_action,
+            axis=1
         )
 
         st.markdown("#### Cluster Summary")
-
         st.dataframe(
-            cluster_profile[
-                [
-                    "Pattern Cluster",
-                    "Pattern Description",
-                    "ProjectCount",
-                    "AvgResourcesToChase",
-                    "AvgChasePct",
-                    "AvgCompletionPct",
-                    "AvgCompliancePct",
-                    "AvgPriorityScore",
-                ]
-            ].round(1),
-            use_container_width=True,
-            hide_index=True,
-        )
+                cluster_profile[
+                    [
+                        "Pattern Cluster",
+                        "Pattern Description",
+                        "ProjectCount",
+                        "AvgResourcesToChase",
+                        "AvgChasePct",
+                        "AvgCompletionPct",
+                        "AvgCompliancePct",
+                        "AvgPriorityScore",
+                    ]
+                ].round(0),
+                width="stretch",
+                use_container_width=True,
+                hide_index=True,
+            )
 
         st.markdown("#### Projects by Pattern")
-
         st.dataframe(
-            project_ml[
-                [
-                    "Project",
-                    "Pattern Cluster",
-                    "Pattern Description",
-                    "TotalResources",
-                    "No Assessment",
-                    "Below Target Only",
-                    "Resources To Chase",
-                    "Chase %",
-                    "Completion %",
-                    "Target Compliance %",
-                    "Priority Score",
-                ]
-            ].sort_values(
-                ["Pattern Description", "Priority Score"],
-                ascending=[True, False],
-            ),
-            use_container_width=True,
-            hide_index=True,
-        )
+                project_ml[
+                    [
+                        "Project",
+                        "Pattern Cluster",
+                        "Pattern Description",
+                        "TotalResources",
+                        "No Assessment",
+                        "Below Target Only",
+                        "Resources To Chase",
+                        "Chase %",
+                        "Completion %",
+                        "Target Compliance %",
+                        "Priority Score",
+                    ]
+                ].sort_values(
+                    ["Pattern Description", "Priority Score"],
+                    ascending=[True, False],
+                ).round(0),
+                width="stretch",
+                hide_index=True,
+            )
 
         pca = PCA(n_components=2)
         pca_result = pca.fit_transform(X_scaled)
@@ -1016,33 +1520,32 @@ try:
         project_ml["Pattern Y"] = pca_result[:, 1]
 
         fig_pattern = px.scatter(
-            project_ml,
-            x="Pattern X",
-            y="Pattern Y",
-            color="Pattern Description",
-            size="TotalResources",
-            hover_name="Project",
-            hover_data=[
-                "Pattern Cluster",
-                "TotalResources",
-                "No Assessment",
-                "Below Target Only",
-                "Resources To Chase",
-                "Chase %",
-                "Completion %",
-                "Target Compliance %",
-                "Priority Score",
-            ],
-            title="Project Pattern Map Based on Competency Gap Behavior",
-        )
+                project_ml,
+                x="Pattern X",
+                y="Pattern Y",
+                color="Pattern Description",
+                size="TotalResources",
+                hover_name="Project",
+                hover_data=[
+                    "Pattern Cluster",
+                    "TotalResources",
+                    "No Assessment",
+                    "Below Target Only",
+                    "Resources To Chase",
+                    "Chase %",
+                    "Completion %",
+                    "Target Compliance %",
+                    "Priority Score",
+                ],
+                title="Project Pattern Map Based on Competency Gap Behavior",
+            )
 
         st.plotly_chart(fig_pattern, use_container_width=True)
 
         st.info(
-            "Interpretation: Projects that appear closer together have similar competency gap behavior. "
-            "This can help identify groups of projects that may need similar interventions."
-        )
-
+                "Interpretation: Projects that appear closer together have similar competency gap behavior. "
+                "This can help identify groups of projects that may need similar interventions."
+            )
     else:
         st.warning("Not enough project records available for project pattern discovery.")
 
@@ -1067,24 +1570,25 @@ if len(project_rank) > 0:
         project_dropdown_options,
     )
 
-    drilldown_df = resource_project_df[
-        resource_project_df["Project"] == selected_drilldown_project
-    ].copy()
+    # Fast-path: use cached per-project frame when available
+    drilldown_df = None
+    if selected_drilldown_project in project_map:
+        drilldown_df = project_map.get(selected_drilldown_project).copy()
+    else:
+        # fallback to filtering in case cache missing
+        drilldown_df = resource_project_df[
+            resource_project_df["Project"] == selected_drilldown_project
+        ].copy()
 
-    drilldown_df = drilldown_df.rename(
-    columns={
-        "primary_skill": "Primary Skill",
-        "career_level_num": "Career Level",
-        }
-    )
+    # Ensure canonical column names exist
+    if COL_RESOURCE_ID in drilldown_df.columns and "Employee ID" not in drilldown_df.columns:
+        drilldown_df = drilldown_df.rename(columns={COL_RESOURCE_ID: "Employee ID"})
 
-    drilldown_df = drilldown_df.rename(
-    columns={
-        COL_RESOURCE_ID: "Employee ID",
-        "primary_skill": "Primary Skill",
-        "career_level_num": "Career Level",
-    }
-)
+    if "primary_skill" in drilldown_df.columns and "Primary Skill" not in drilldown_df.columns:
+        drilldown_df = drilldown_df.rename(columns={"primary_skill": "Primary Skill"})
+
+    if "career_level_num" in drilldown_df.columns and "Career Level" not in drilldown_df.columns:
+        drilldown_df = drilldown_df.rename(columns={"career_level_num": "Career Level"})
 
     drilldown_cols = [
         "Employee ID",
@@ -1096,9 +1600,20 @@ if len(project_rank) > 0:
         "Action Reason",
     ]
 
-    st.write(f"Resources in selected project: {len(drilldown_df):,}")
+    # Order by Action Reason: No Assessment first, then Below Target
+    if "Action Reason" in drilldown_df.columns:
+        order = ["No Assessment", "Below Target"]
+        drilldown_df["Action Reason Order"] = pd.Categorical(
+            drilldown_df["Action Reason"],
+            categories=order,
+            ordered=True,
+        )
+
+        drilldown_df = drilldown_df.sort_values(by=["Action Reason Order"], na_position="last")
+        drilldown_df = drilldown_df.drop(columns=["Action Reason Order"])
+
     st.dataframe(
-        drilldown_df[drilldown_cols],
+        drilldown_df[[c for c in drilldown_cols if c in drilldown_df.columns]],
         use_container_width=True,
         hide_index=True,
     )
@@ -1335,8 +1850,8 @@ try:
                     "AvgTargetGapPct",
                     "AvgPriorityScore",
                 ]
-            ].round(1),
-            use_container_width=True,
+            ].round(0),
+            width="stretch",
             hide_index=True,
         )
 
@@ -1463,40 +1978,177 @@ with c2:
 # FILTERED RESOURCE CHASE DETAIL
 # ============================================================
 
-st.subheader("Filtered Resource Chase Detail")
+# Option to show/hide the filtered resource detail (hidden by default to speed UI)
+show_resource_detail = st.sidebar.checkbox("Show Resource Assessment Detail", value=False)
 
-filtered_display = filtered_detail.copy()
+if show_resource_detail:
+    st.subheader("Filtered Resource Chase Detail")
 
-filtered_display = filtered_display.rename(
+    filtered_display = filtered_detail.copy()
+
+    filtered_display = filtered_display.rename(
+        columns={
+            "Enterpriseid": "EID",
+            "primary_skill": "Primary Skill",
+            "career_level_num": "Career Level",
+        }
+    )
+
+    cols_to_show = [
+        "EID",
+        "Project",
+        "Primary Skill",
+        "Career Level",
+        "Target",
+        "Actual",
+        "Action Reason",
+    ]
+
+    st.dataframe(
+        filtered_display[cols_to_show],
+        use_container_width=True,
+        hide_index=True,
+    )
+
+    csv_data = filtered_display[cols_to_show].to_csv(index=False).encode("utf-8")
+
+    st.download_button(
+        "Download filtered chase list as CSV",
+        data=csv_data,
+        file_name="filtered_mycompetency_chase_list.csv",
+        mime="text/csv",
+    )
+
+# ============================================================
+# EXCEL OUTPUT FOR PEOPLE LEAD / PROJECT FOLLOW-UP
+# ============================================================
+
+st.subheader("People Lead Follow-up Pack")
+
+st.caption(
+    "Generate an Excel-based chase pack that can be attached to an email for People Lead / Project Lead follow-up."
+)
+
+summary_df = pd.DataFrame(
+    [
+        {
+            "Business Group": scorecard_scope,
+            "Assessment Scope": assessment_scope if "assessment_scope" in globals() else "Primary",
+            "Total Resources": kpi_total,
+            "Assessed Resources": kpi_assessed,
+            "Completion %": round(safe_pct(kpi_assessed, kpi_total), 0),
+            "Target Compliance %": round(safe_pct(kpi_meeting_target, kpi_total), 0),
+            "No Assessment": kpi_no_assessment,
+            "Below Target": kpi_below_target,
+        }
+    ]
+)
+
+project_export = project_rank[
+    [
+        "Project",
+        "TotalResources",
+        "No Assessment",
+        "Below Target Only",
+        "Resources To Chase",
+        "Chase %",
+        "Completion %",
+        "Target Compliance %",
+        "Priority Score",
+    ]
+].copy()
+
+project_export = project_export.round(0)
+
+resource_export = filtered_display[cols_to_show].copy()
+
+
+action_sort_order = {
+    "No Assessment": 1,
+    "Below Target": 2,
+    "Meeting Target": 3,
+}
+
+resource_export["Action Sort"] = (
+    resource_export["Action Reason"]
+    .map(action_sort_order)
+    .fillna(99)
+)
+
+
+
+resource_export = resource_export.sort_values(
+    by=[
+        "Project",
+        "Action Sort",
+        "Career Level",
+        "Primary Skill",
+        "EID",
+    ],
+    ascending=[
+        True,
+        True,
+        False,
+        True,
+        True,
+    ],
+)
+
+resource_export = resource_export.drop(columns=["Action Sort"])
+resource_export_grouped = build_grouped_resource_export(resource_export)
+
+skill_export = skill_gap[
+    [
+        "primary_skill",
+        "TotalResources",
+        "NoAssessment",
+        "BelowTargetOnly",
+        "Resources To Chase",
+        "Target Gap %",
+        "Priority Score",
+    ]
+].copy()
+
+skill_export = skill_export.rename(
     columns={
         "primary_skill": "Primary Skill",
-        "career_level_num": "Career Level",
+        "NoAssessment": "No Assessment",
+        "BelowTargetOnly": "Below Target Only",
     }
 )
 
-cols_to_show = [
-    "PeopleKey",
-    "Project",
-    "Primary Skill",
-    "Career Level",
-    "Target",
-    "Actual",
-    "Action Reason",
-]
+skill_export = skill_export.round(0)
 
-st.write(f"Rows shown: {len(filtered_display):,}")
+career_export = career_summary[
+    [
+        "Career Level",
+        "Total Resources",
+        "No Assessment",
+        "Completion %",
+        "Target Compliance %",
+        "Below Target",
+    ]
+].copy()
 
-st.dataframe(
-    filtered_display[cols_to_show],
-    use_container_width=True,
-    hide_index=True,
+career_export = career_export.round(0)
+
+resource_export_grouped = build_grouped_resource_export(resource_export)
+
+excel_output = create_chase_excel(
+    summary_df=summary_df,
+    project_df=project_export,
+    resource_detail_df=resource_export_grouped,
+    skill_gap_df=skill_export,
+    career_summary_df=career_export,
+    selected_business_group=scorecard_scope,
+    assessment_scope=assessment_scope if "assessment_scope" in globals() else "Primary",
 )
-
-csv_data = filtered_display[cols_to_show].to_csv(index=False).encode("utf-8")
 
 st.download_button(
-    "Download filtered chase list as CSV",
-    data=csv_data,
-    file_name="filtered_mycompetency_chase_list.csv",
-    mime="text/csv",
+    "Download People Lead Follow-up Excel",
+    data=excel_output,
+    file_name="mycompetency_people_lead_followup_pack.xlsx",
+    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
 )
+
+
